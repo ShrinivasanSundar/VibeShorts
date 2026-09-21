@@ -1,0 +1,48 @@
+[project]
+name = "vibeshorts"
+version = "0.1.0"
+description = "AI-native video editor CLI — agents, MCP, Antigravity SDK, and GCP Vertex integrations"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "VibeShorts" }]
+dependencies = [
+    "google-antigravity>=0.1.17",
+    "google-genai>=1.0.0",
+    "google-cloud-speech>=2.27.0",
+    "pydantic>=2.0",
+    "typer[all]>=0.12.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+preprocess = [
+    "scenedetect[opencv]>=0.6.4",
+    "faster-whisper>=1.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+vibeshorts = "vibeshorts.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/vibeshorts"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/vibeshorts" = "vibeshorts"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

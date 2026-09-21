@@ -1,0 +1,33 @@
+name: dtc-testimonial
+description: Direct-to-consumer testimonial ad arc for short-form vertical video
+
+arc:
+  - segment: hook
+    start: 0
+    end: 3
+    goal: "High-energy visual or problem statement"
+  - segment: problem
+    start: 3
+    end: 10
+    goal: "Relatable pain point"
+  - segment: solution
+    start: 10
+    end: 20
+    goal: "Product showcase with B-roll cutaway"
+  - segment: proof
+    start: 20
+    end: 27
+    goal: "Social proof / customer testimony"
+  - segment: cta
+    start: 27
+    end: 30
+    goal: "Clear call to action"
+
+pacing:
+  min_clip_duration: 1.5
+  max_clip_duration: 5.0
+  broll_ratio: 0.35
+
+captions:
+  style: tiktok-karaoke
+  highlight_color: "#4ACFFF"

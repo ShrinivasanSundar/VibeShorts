@@ -66,3 +66,15 @@ Rather than having the AI model generate raw video files directly for every simp
 | **B-roll & Video Remixing** | Veo 3.1 / Veo API (Vertex AI) / Omni / NanoBanana |
 | **Music Generation** | Lyria 3.5 (Gemini API / Vertex AI Studio) |
 | **Core Editing Engine** | FFmpeg server-side or open-source headless engines (e.g., Diffusion Studio) |
+
+## VibeShorts CLI (Implementation)
+
+The `cli/` directory contains the initial VibeShorts CLI implementation:
+
+```bash
+cd cli && pip install -e ".[preprocess]"
+vibeshorts init ./my-project
+vibeshorts create --footage ./footage --brief ./brief.yaml
+```
+
+See [cli/README.md](cli/README.md) for full documentation.

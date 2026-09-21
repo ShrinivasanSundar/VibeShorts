@@ -1,0 +1,25 @@
+gcp:
+  project: "${GOOGLE_CLOUD_PROJECT}"
+  location: "us-central1"
+  genmedia_bucket: "${GENMEDIA_BUCKET}"
+  use_vertex: true
+
+antigravity:
+  model: "gemini-2.5-flash"
+  vertex: true
+  mcp_config_path: ".agents/mcp_config.json"
+  skills_paths:
+    - "./skills"
+    - ".agents/skills"
+
+integrations:
+  enable_mcp_genmedia: true
+  enable_veo: true
+  enable_lyria: true
+  enable_speech: true
+  hyperframes_bin: "npx"
+
+default_pipeline: "config/pipeline/default.yaml"
+output_dir: "./renders"
+review_threshold: 0.65
+max_retries: 2
