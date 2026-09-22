@@ -1,7 +1,7 @@
 [project]
 name = "vibeshorts"
 version = "0.1.0"
-description = "AI-native video editor CLI — agents, MCP, Antigravity SDK, and GCP Vertex integrations"
+description = "AI-native video editor — agents, MCP, Antigravity SDK, and GCP Vertex integrations"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -31,17 +31,17 @@ dev = [
 ]
 
 [project.scripts]
-vibeshorts = "vibeshorts.main:app"
+vibeshorts = "vibeshorts.cli.main:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src/vibeshorts"]
+packages = ["src/vibeshorts"]
 
-[tool.hatch.build.targets.wheel.sources]
-"src/vibeshorts" = "vibeshorts"
+[tool.hatch.build.targets.wheel.force-include]
+"cli" = "vibeshorts/cli"
 
 [tool.ruff]
 line-length = 100

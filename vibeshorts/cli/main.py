@@ -6,7 +6,7 @@ import typer
 from rich.console import Console
 
 from vibeshorts import __version__
-from vibeshorts.commands import chat, config_cmd, create, init, render, studio
+from vibeshorts.cli.commands import chat, config_cmd, create, init, render, studio
 
 console = Console()
 

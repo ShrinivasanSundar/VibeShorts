@@ -67,14 +67,19 @@ Rather than having the AI model generate raw video files directly for every simp
 | **Music Generation** | Lyria 3.5 (Gemini API / Vertex AI Studio) |
 | **Core Editing Engine** | FFmpeg server-side or open-source headless engines (e.g., Diffusion Studio) |
 
-## VibeShorts CLI (Implementation)
+## VibeShorts product (`vibeshorts/`)
 
-The `cli/` directory contains the initial VibeShorts CLI implementation:
+Shared engine and interfaces live under `vibeshorts/`:
+
+- **`src/vibeshorts/`** — agents, models, Vertex/MCP, pipeline, tools
+- **`cli/`** — command-line interface only
+- **`webui/`** — reserved for a later browser UI
+- **`config/`**, **`skills/`** — shared templates
 
 ```bash
-cd cli && pip install -e ".[preprocess]"
+cd vibeshorts && pip install -e ".[preprocess]"
 vibeshorts init ./my-project
 vibeshorts create --footage ./footage --brief ./brief.yaml
 ```
 
-See [cli/README.md](cli/README.md) for full documentation.
+See [vibeshorts/README.md](vibeshorts/README.md) for full documentation.

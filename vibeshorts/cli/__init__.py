@@ -1,0 +1,1 @@
+"""VibeShorts command-line interface."""
