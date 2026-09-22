@@ -1,0 +1,10 @@
+steps:
+  - agent: director
+  - agent: trim_refiner
+  - agent: editor
+  - agent: reviewer
+    retry_if:
+      metric: overall
+      threshold: 0.65
+      max_retries: 2
+      feedback_target: director
