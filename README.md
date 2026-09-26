@@ -116,3 +116,7 @@ Gemini watches the rendered MP4 and returns a patch list, not a single score: ti
 2. **The EditPlan carries the frame.** Every entry has a source shot, in/out snapped to a word or pause, a 9:16 crop, a caption-safe region, and music and ducking cues. FFmpeg executes that plan and does not invent framing or mix levels.
 3. **The tight pass reads the audio index.** The Trim Refiner snaps to a word or pause already stored on the shot. A Gemini probe runs only when the semantic edge is ambiguous.
 4. **The Reviewer patches, then stops.** It returns tighten hook, swap shot, or reframe. Story patches go to the Director with a retry cap. Caption and loudness failures stay with the Editor.
+
+## Future improvements
+- Connect to Google Photos 
+- Export the video assets to Davinci Resolve and Adobe Premiere
