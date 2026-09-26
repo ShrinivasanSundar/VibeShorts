@@ -1,68 +1,118 @@
-**I’m thinking of I'm thinking of building a AI video editor using Google Cloud. So I'm thinking of using models like Gemini Video Understanding, agentic Video Understanding, VEO Omni models for editing a video, creating generating a b-roll, creating a remix of the video, and finally giving a song using Lyria. And I want to use it with the speech-to-text voice capabilities so that user can just talk to the agent, the video editing agent, and that agent will actually make the changes in the video and then give us the final results. Let me know this feasibility and tell me what do you think and what are all the challenges in this idea.**
 
-Your idea is **technically feasible** and describes the direction the AI video editing landscape is heading. Combining conversational multimodal input with background tool calling to manipulate video timelines creates a powerful, hands-free video editing workspace.
+VibeShorts, an autonomous AI video editing system built with **Google Gemini** (via Google AntiGravity SDK), **Google Cloud Speech-to-Text**, Vertex AI for Veo, Omni, Lyria, and **FFmpeg**.
 
-Google’s ecosystem provides the necessary building blocks for this architecture:
+---
 
-- **Gemini (Agentic Video Understanding):** Parses long-form video, extracts timestamps, detects cut points, and acts as the conversational editor agent.
-- **Google Cloud Speech-to-Text / Gemini Live:** Drives real-time, low-latency audio interaction with the user.
-- **Veo (Veo 3.1 / Omni capabilities):** Handles B-roll generation, scene extension, and AI-driven video-to-video editing.
-- **Lyria (via Vertex AI / Gemini API):** Generates background scores and soundtracks matching the video mood and length.
+## 1. Executive Summary
 
-### Recommended System Architecture
+VibeShorts automates short-form video creation (such as TikTok, Instagram Reels, and DTC video ads). 
 
-Rather than having the AI model generate raw video files directly for every simple edit, use a **Hybrid Orchestration Model**:
+It accepts:
+1. A folder of raw, unstructured video clips (A-roll talking heads, B-roll product shots).
+2. A structured creative brief (target product, audience, tone, duration) - Idea from users and changes in the video.
+
+It processes this through an **ensemble of AI agents**. Ingest writes a deterministic clock, the Director plans the story, FFmpeg executes the frame, and the Reviewer returns a short patch list.
 
 ```
-[ User Speech ] ---> [ Speech-to-Text / Multimodal Agent ]
-                                |
-                   (Determines Editing Intent)
-                                |
-        +-----------------------+-----------------------+
-        |                                               |
-[ Timeline Action ]                           [ Generative Task ]
-(Cuts, trims, sequencing)                    (B-roll, remix, music)
-        |                                               |
-        v                                               v
-[ Programmatic Editor ]                         [ Veo / Lyria APIs ]
-(FFmpeg / Open-source Engine)                 (Generates media assets)
-        |                                               |
-        +-----------------------+-----------------------+
-                                |
-                      [ Final Video Render ]
+Raw Footage + Creative Brief
+            │
+            ▼
+   [ 1. Ingest ]                Scene cuts, voice activity, loudness, face / product boxes
+            │                   Google Speech-to-Text: transcript + word timestamps
+            │                   Gemini labels each short shot (what is shown, A-roll or B-roll).
+            │                   Gemini does not own the timestamps.
+            │                   Outputs: FootageIndex of shots, cached by file hash
+            ▼
+   [ 2. Director Agent ]        Gemini AntiGravity SDK
+            │                   Searches FootageIndex & writes a structured EditPlan
+            │                   Each entry: source shot, in/out, 9:16 crop,
+            │                   caption-safe region, music and ducking cues
+            ▼
+   [ 3. Trim Refiner ]          Snaps IN/OUT to the nearest word or pause on the audio index
+            │                   Gemini probe only when the semantic edge is ambiguous
+            ▼
+   [ 4. Editor (Executor) ]     FFmpeg
+            │                   Cuts, reframes to 9:16, burns ASS inside the safe region,
+            │                   mixes audio from the plan's music and ducking cues
+            ▼
+   [ 5. Reviewer Agent ]        Gemini watches the rendered MP4
+            │                   Returns a patch list: tighten hook, swap shot, reframe
+            │
+            ├──► Story patches ──────────────► Director (capped retries)
+            ├──► Caption / loudness failures ► Editor (not the Director)
+            └──► No remaining patches ───────► Exports final video
 ```
 
-1. **Agent Logic Layer (Gemini):** Takes user voice input and reads the current video project state. Gemini uses **Agentic Video Understanding** to identify exact timestamps (e.g., "Find where I talk about coffee") without re-processing the entire video every turn.
-2. **Deterministic Editing Engine (FFmpeg / WebAssembly):** Handles standard editing actions (cutting, rearranging clips, applying transitions, stitching) via code. This prevents unnecessary generation costs and runs instantly.
-3. **Generative Engine (Veo & Lyria):** Triggered only when the user requests generative edits (e.g., "Add B-roll of a futuristic city here" or "Generate a relaxing lofi beat for the background").
+### Backend / Deployment
 
-### Core Technical & Product Challenges
+GCP:
 
-**1. Frame Precision vs. AI Hallucination**
+* A bucket for uploaded photos, video footage, and editor results.
+* Vertex AI: Veo, Omni, Gemini, and Lyria APIs.
+* Google Cloud Speech-to-Text for transcripts and word-level caption timestamps.
+* A GCE VM (Container-Optimized OS) that runs the backend and serves the frontend. FFmpeg renders and Gemini calls stay on the VM. They outlive a workflow job.
 
-- *Challenge:* Generative AI models struggle with pinpoint millisecond accuracy needed for precise cuts. An LLM might say "Cut from 00:12 to 00:18," but visually the cut makes sense at 00:12.4.
-- *Mitigation:* Have Gemini output high-level intent, and feed the frames around that timestamp into a computer vision/silence-detection script to auto-snap to the nearest cut or silent gap.
+Frontend: a Next.js chat on the right, and a video viewer on the left for the edited cut, with upload for photos and footage.
 
-**2. Latency in Conversational Editing**
+**GitHub Actions deploys the container. It does not run the edit.**
 
-- *Challenge:* Video generation models (Veo) take seconds to minutes to render, breaking the conversational flow of "Talk to edit."
-- *Mitigation:* Decouple the preview from the final render. Show draft cut previews on the timeline instantly using programmatic rendering, and queue generative background tasks (like Veo B-roll or Lyria music generation) asynchronously.
+1. **Authenticate with Workload Identity Federation.** GitHub’s OIDC token impersonates a deploy service account. No JSON key in repository secrets.
+2. **Build and push** the backend and Next.js image to Artifact Registry on each push to `main`.
+3. **Update the GCE VM** to that image. The footage bucket stays in place. Vertex, Speech-to-Text, Veo, and Lyria are APIs the VM calls with its own service account.
 
-**3. Visual & Style Consistency**
+The deploy service account needs Artifact Registry writer and compute admin on that instance. The runtime service account needs Speech-to-Text, Vertex AI, and object access on the footage bucket.
 
-- *Challenge:* Generating B-roll via Veo mid-video can lead to jarring visual shifts if lighting, style, or aspect ratios do not match the base footage.
-- *Mitigation:* Extract keyframe images from the original video using Gemini, then use those frame images as visual references (Image-to-Video) in Veo to maintain coherent lighting and color grading.
+---
 
-**4. Compute Costs**
+## 2. System Architecture & Core Components
 
-- *Challenge:* Repeatedly querying generative video and music models for iterative tweaks will quickly become cost-prohibitive.
-- *Mitigation:* Cache processed video metadata (transcripts, scene changes, detected objects) so Gemini only analyzes the raw video once, and perform all preliminary timeline edits visually before triggering generative rendering.
+### 1. Ingest writes the clock
+Deterministic ingest runs before any agent call. It cuts scenes, detects voice activity, measures loudness, and records face or product boxes. **Google Cloud Speech-to-Text** transcribes each shot and returns a word-level timestamp for every word. Those timestamps drive auto captions and give the Trim Refiner a clock to snap against. Gemini then labels each short shot: what is shown, and whether it is A-roll or B-roll. Speech-to-Text owns the transcript and the timestamps. Gemini does not.
 
-### Proposed Tech Stack
-| **Layer** | **Recommended Technology** |
-| --- | --- |
-| **Agent / Orchestrator** | Gemini 3.7 / 3.6 Flash (Vertex AI) with Agentic Video Understanding enabled |
-| **Voice Interface** | Google Cloud Speech-to-Text / Gemini Live Websocket |
-| **B-roll & Video Remixing** | Veo 3.1 / Veo API (Vertex AI) / Omni / NanoBanana |
-| **Music Generation** | Lyria 3.5 (Gemini API / Vertex AI Studio) |
-| **Core Editing Engine** | FFmpeg server-side or open-source headless engines (e.g., Diffusion Studio) |
+Veo, Omni, and Lyria enter here as a side door. Generated B-roll, stills, and a music bed are indexed like any other asset. They are not a later stage on the reviewer loop.
+
+### 2. Director Agent
+Gemini via the AntiGravity SDK searches the `FootageIndex` against the creative brief and writes a structured `EditPlan`. The story order is the Director's job. The clock on each cut comes from the index.
+
+### 3. Trim Refiner
+In and out points snap to the nearest word or pause already stored on the shot. A short Gemini probe runs only when the semantic edge is ambiguous (a thought that should end before the silence, a reaction that should hold past the last word). The Director's story order stays intact.
+
+### 4. EditPlan carries the frame
+Each `EditPlanEntry` is one cut the Editor can execute without guessing:
+
+* Source shot, with in/out already snapped to a word or pause.
+* A 9:16 crop anchored on the face or product box.
+* A caption-safe region that stays clear of platform chrome.
+* Music and ducking cues, so the mix is specified in the plan.
+
+FFmpeg cuts, reframes, burns TikTok-style ASS captions from the Speech-to-Text word timestamps (shifted onto the output timeline), and mixes from those cues.
+
+### 5. Reviewer patches, then stops
+Gemini watches the rendered MP4 and returns a patch list, not a single score: tighten the hook, swap a shot, reframe.
+
+* Story patches go back to the Director. Retries are capped, and each retry edits the previous plan.
+* Caption drift and loudness failures stay with the Editor. They are not re-planned as story.
+* When the list is empty, or the cap is hit, the video is the final export.
+
+---
+
+## 3. Data Models (`src/models/schemas.py`)
+
+| Schema | Purpose |
+| :--- | :--- |
+| `CreativeBrief` | Defines `product`, `audience`, `tone`, `duration_seconds`, and optional `style_ref`. |
+| `WordTimestamp` | Speech-to-Text `word`, `start`, `end` on the source shot. Captions shift these onto the output timeline. |
+| `Shot` | One scene: `source_file`, `start_time`, `end_time`, Speech-to-Text `transcript` and `words`, `roll_type`, loudness, and face or product boxes. Gemini adds what is shown. |
+| `FootageIndex` | Catalog of shots, cached by file hash. Includes generated assets from Veo, Omni, and Lyria. |
+| `EditPlanEntry` | One cut: source shot, in/out snapped to a word or pause, 9:16 crop, caption-safe region, music and ducking cues, `text_overlay`. |
+| `EditPlan` | Ordered blueprint the Editor executes. |
+| `ReviewPatch` | One edit: `tighten_hook`, `swap_shot`, or `reframe`, or an Editor-owned caption / loudness fix. Story patches target the Director and stop at the retry cap. |
+
+---
+
+## 4. Key Takeaways for VibeShorts
+
+1. **Ingest owns the clock.** Scene cuts, voice activity, loudness, and face or product boxes are deterministic. Google Cloud Speech-to-Text writes the transcript and the word timestamps used for auto captions. Gemini labels shots. It does not emit timestamps.
+2. **The EditPlan carries the frame.** Every entry has a source shot, in/out snapped to a word or pause, a 9:16 crop, a caption-safe region, and music and ducking cues. FFmpeg executes that plan and does not invent framing or mix levels.
+3. **The tight pass reads the audio index.** The Trim Refiner snaps to a word or pause already stored on the shot. A Gemini probe runs only when the semantic edge is ambiguous.
+4. **The Reviewer patches, then stops.** It returns tighten hook, swap shot, or reframe. Story patches go to the Director with a retry cap. Caption and loudness failures stay with the Editor.
