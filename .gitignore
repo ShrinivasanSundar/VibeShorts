@@ -1,0 +1,40 @@
+# Monorepo root ignore
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+.pytest_cache/
+storage/
+*.mp4
+*.wav
+*.ass
+*.srt
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+build/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment & Local Secrets
+.env
+.env.local
+.env.*.local
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
