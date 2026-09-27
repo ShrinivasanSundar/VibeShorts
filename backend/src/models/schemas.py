@@ -6,6 +6,7 @@ Adheres strictly to the architectural boundary:
 - EditPlan carries the exact frame and audio mixing instructions for FFmpeg.
 """
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
@@ -172,6 +173,50 @@ class JobStatus(BaseModel):
     error: Optional[str] = None
 
 
+# ─── Conversation Models ────────────────────────────────────────────
+
+
+class ConversationTurn(BaseModel):
+    """A single turn in the server-side conversation history."""
+    id: str
+    role: Literal["user", "assistant", "system"]
+    content: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    action: Optional[str] = None
+    plan_snapshot_id: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class Conversation(BaseModel):
+    """Server-side conversation with full history. Server owns plan & brief state."""
+    conversation_id: str
+    project_id: str
+    turns: List[ConversationTurn] = Field(default_factory=list)
+    current_plan: Optional[EditPlan] = None
+    current_brief: Optional[CreativeBrief] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class StreamEvent(BaseModel):
+    """SSE event payload for streamed AI responses."""
+    event_type: Literal["token", "action", "plan_update", "error", "done"]
+    content: Optional[str] = None
+    action: Optional[str] = None
+    plan: Optional[EditPlan] = None
+    brief: Optional[CreativeBrief] = None
+    turn_id: Optional[str] = None
+    suggested_prompts: List[str] = Field(default_factory=list)
+
+
+class SendMessageRequest(BaseModel):
+    """Client sends only the message text. Server owns plan & brief state."""
+    message: str
+
+
+# ─── Legacy Models (kept for backward compatibility during migration) ────
+
+
 class ChatRequest(BaseModel):
     message: str
     edit_plan: Optional[EditPlan] = None
@@ -184,4 +229,5 @@ class ChatResponse(BaseModel):
     suggested_plan: Optional[EditPlan] = None
     suggested_brief: Optional[CreativeBrief] = None
     suggested_prompts: List[str] = Field(default_factory=list)
+
 

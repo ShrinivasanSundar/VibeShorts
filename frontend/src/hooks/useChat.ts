@@ -1,8 +1,13 @@
 "use client";
 
-import { useState, useCallback } from "react";
-import type { CreativeBrief, EditPlan, JobStatus } from "@/lib/types";
+import { useState, useCallback, useEffect, useRef } from "react";
+import type { CreativeBrief, EditPlan, JobStatus, Conversation } from "@/lib/types";
 import {
+  createConversation,
+  sendConversationMessage,
+  subscribeToConversationStream,
+  updateConversationPlan,
+  triggerConversationRender,
   triggerGeneration,
   subscribeToJobStream,
   getVideoUrl,
@@ -109,6 +114,12 @@ export function useChat(backendOnline: boolean | null) {
   const [isRenderingTimeline, setIsRenderingTimeline] = useState(false);
   const [uploadedCount, setUploadedCount] = useState(0);
 
+  // Conversation state
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const streamCleanupRef = useRef<(() => void) | null>(null);
+  const streamingMsgRef = useRef<string>("");
+  const streamingTurnIdRef = useRef<string | null>(null);
+
   const [messages, setMessages] = useState<MessageItem[]>([
     {
       id: "msg_init",
@@ -124,16 +135,101 @@ export function useChat(backendOnline: boolean | null) {
     setMessages((prev) => [...prev, ...newMsgs]);
   }, []);
 
+  const updateStreamingMessage = useCallback((turnId: string, text: string) => {
+    setMessages((prev) => {
+      const existing = prev.find((m) => m.id === turnId);
+      if (existing) {
+        return prev.map((m) => (m.id === turnId ? { ...m, text } : m));
+      } else {
+        return [
+          ...prev,
+          {
+            id: turnId,
+            sender: "director" as const,
+            text,
+            timestamp: now(),
+          },
+        ];
+      }
+    });
+  }, []);
+
+  // ── Initialize conversation ──────────────────────────────────────
+
+  const initConversation = useCallback(async () => {
+    if (!backendOnline) return;
+
+    try {
+      const conv = await createConversation(projectId, brief);
+      setConversationId(conv.conversation_id);
+
+      // Subscribe to SSE stream
+      const cleanup = subscribeToConversationStream(conv.conversation_id, {
+        onToken: (text, turnId) => {
+          if (turnId) {
+            streamingMsgRef.current += text;
+            streamingTurnIdRef.current = turnId;
+            updateStreamingMessage(turnId, streamingMsgRef.current);
+          }
+        },
+        onAction: (action, prompts, turnId) => {
+          // Action received — could trigger re-render, etc.
+          if (action === "re-render_ready") {
+            // Auto-trigger render if the AI says it's ready
+          }
+        },
+        onPlanUpdate: (plan) => {
+          setCurrentPlan(plan);
+        },
+        onError: (error) => {
+          console.error("Stream error:", error);
+          setIsGenerating(false);
+        },
+        onDone: (_prompts, turnId) => {
+          setIsGenerating(false);
+          // Reset streaming state for next message
+          streamingMsgRef.current = "";
+          streamingTurnIdRef.current = null;
+        },
+        onConnected: () => {
+          console.log("SSE stream connected");
+        },
+      });
+
+      streamCleanupRef.current = cleanup;
+    } catch (err) {
+      console.warn("Failed to create conversation, will use legacy API:", err);
+    }
+  }, [backendOnline, projectId, brief, updateStreamingMessage]);
+
+  // Initialize conversation on mount when backend is online
+  useEffect(() => {
+    if (backendOnline && !conversationId) {
+      initConversation();
+    }
+
+    return () => {
+      streamCleanupRef.current?.();
+    };
+  }, [backendOnline, conversationId, initConversation]);
+
   // ── New Project ──────────────────────────────────────────────────
 
   const resetProject = useCallback(() => {
+    // Cleanup old SSE stream
+    streamCleanupRef.current?.();
+    streamCleanupRef.current = null;
+
     const newId = `vibe_${Math.random().toString(36).substring(2, 8)}`;
     setProjectId(newId);
+    setConversationId(null);
     setCurrentPlan(null);
     setVideoUrl(null);
     setJobStatus(null);
     setIsGenerating(false);
     setUploadedCount(0);
+    streamingMsgRef.current = "";
+    streamingTurnIdRef.current = null;
     setMessages([
       {
         id: `msg_welcome_${Date.now()}`,
@@ -277,7 +373,22 @@ export function useChat(backendOnline: boolean | null) {
         return;
       }
 
-      // Conversational edit or query
+      // ── New conversation-based path ──────────────────────────────
+      if (conversationId && backendOnline) {
+        setIsGenerating(true);
+        streamingMsgRef.current = "";
+        try {
+          await sendConversationMessage(conversationId, text);
+          // Response will arrive via SSE stream — the onToken/onDone callbacks
+          // in the stream subscription handle message rendering and state updates
+          return;
+        } catch (err) {
+          console.warn("Conversation message failed, falling back to legacy:", err);
+          setIsGenerating(false);
+        }
+      }
+
+      // ── Legacy fallback (stateless /chat endpoint) ───────────────
       setIsGenerating(true);
       try {
         const response = await sendChatMessage(projectId, text, currentPlan, brief);
@@ -308,14 +419,24 @@ export function useChat(backendOnline: boolean | null) {
         setIsGenerating(false);
       }
     },
-    [currentPlan, brief, projectId, appendMessages, runGenerationPipeline],
+    [currentPlan, brief, projectId, conversationId, backendOnline, appendMessages, runGenerationPipeline],
   );
 
-  // ── Select cut → open modal ──────────────────────────────────────
+  // ── Update plan (from timeline editor) ───────────────────────────
 
   const handleUpdatePlan = useCallback(
-    (updated: EditPlan) => {
+    async (updated: EditPlan) => {
       setCurrentPlan(updated);
+
+      // Push to server if conversation exists
+      if (conversationId && backendOnline) {
+        try {
+          await updateConversationPlan(conversationId, updated);
+        } catch (err) {
+          console.warn("Failed to sync plan update to server:", err);
+        }
+      }
+
       appendMessages({
         id: `msg_timeline_edit_${Date.now()}`,
         sender: "system",
@@ -324,7 +445,7 @@ export function useChat(backendOnline: boolean | null) {
         plan: updated,
       });
     },
-    [appendMessages],
+    [conversationId, backendOnline, appendMessages],
   );
 
   // ── Re-render timeline ───────────────────────────────────────────
@@ -334,7 +455,14 @@ export function useChat(backendOnline: boolean | null) {
     setIsRenderingTimeline(true);
 
     try {
-      const res = await renderCustomPlan(projectId, currentPlan);
+      // Use conversation-based render if available
+      let res: { video_url: string };
+      if (conversationId && backendOnline) {
+        res = await triggerConversationRender(conversationId);
+      } else {
+        res = await renderCustomPlan(projectId, currentPlan);
+      }
+
       setVideoUrl(res.video_url);
       setIsRenderingTimeline(false);
 
@@ -349,7 +477,7 @@ export function useChat(backendOnline: boolean | null) {
     } catch {
       setIsRenderingTimeline(false);
     }
-  }, [currentPlan, projectId, appendMessages]);
+  }, [currentPlan, conversationId, backendOnline, projectId, appendMessages]);
 
   return {
     projectId,
@@ -361,6 +489,7 @@ export function useChat(backendOnline: boolean | null) {
     isRenderingTimeline,
     uploadedCount,
     messages,
+    conversationId,
 
     resetProject,
     handleUploadComplete,

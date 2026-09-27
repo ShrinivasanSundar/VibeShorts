@@ -30,6 +30,11 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+*.json.secret
+*firebase*.json
+*service-account*.json
+*credentials*.json
+*.key.json
 
 # IDE & OS
 .idea/

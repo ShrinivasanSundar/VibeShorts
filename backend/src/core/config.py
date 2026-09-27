@@ -1,6 +1,7 @@
 """Configuration and environment settings for VibeShorts."""
 
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,10 +14,14 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     API_V1_PREFIX: str = "/api/v1"
 
+    # API Keys & Credentials
+    GEMINI_API_KEY: Optional[str] = None
+    GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
+
     # Google Cloud Platform
-    GCP_PROJECT_ID: str = "vibeshorts-dev"
+    GCP_PROJECT_ID: str = "vibeshorts-fb"
     GCP_LOCATION: str = "us-central1"
-    GCS_BUCKET_NAME: str = "vibeshorts-media-bucket"
+    GCS_BUCKET_NAME: str = "vibeshorts-fb.firebasestorage.app"
     GCP_STT_RECOGNIZER: str = "_"  # Default global recognizer or custom recognizer id
 
     # Gemini & Vertex AI Models
@@ -37,9 +42,8 @@ class Settings(BaseSettings):
     TEMP_DIR: Path = STORAGE_DIR / "temp"
     OUTPUT_DIR: Path = STORAGE_DIR / "outputs"
 
-    # External Binaries & Services
+    # External Binaries
     FFMPEG_PATH: str = "ffmpeg"
-    REDIS_URL: str = "redis://localhost:6379/0"
 
     model_config = SettingsConfigDict(
         env_file=".env",

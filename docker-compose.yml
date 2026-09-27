@@ -8,12 +8,9 @@ services:
     environment:
       - ENVIRONMENT=development
       - DEBUG=true
-      - GCP_PROJECT_ID=vibeshorts-dev
-      - REDIS_URL=redis://redis:6379/0
+      - GCP_PROJECT_ID=vibeshorts-fb
     volumes:
       - ./backend/storage:/app/storage
-    depends_on:
-      - redis
 
   frontend:
     build:
@@ -26,7 +23,3 @@ services:
     depends_on:
       - backend
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"

@@ -146,13 +146,27 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
         );
       })}
 
-      {/* Starter Loader (GIF-style animation interpreting video generation loading) */}
-      {isGenerating && (
+      {/* Pipeline Loader for actual video rendering jobs */}
+      {isGenerating && activeJob && (
         <div className="w-full self-center message-enter">
           <VideoGenerationLoader
-            progress={activeJob?.progress_percentage || 45}
-            stageName={activeJob?.message || "Directing cut sequence and audio clocks..."}
+            progress={activeJob.progress_percentage || 45}
+            stageName={activeJob.message || "Directing cut sequence and audio clocks..."}
           />
+        </div>
+      )}
+
+      {/* Director Typing Indicator while waiting for streaming response */}
+      {isGenerating && !activeJob && messages.length > 0 && messages[messages.length - 1].sender === "user" && (
+        <div className="message-enter flex items-center gap-2 self-start">
+          <div className="w-6 h-6 rounded-lg bg-primary text-primary-foreground flex items-center justify-center flex-shrink-0 text-xs">
+            <Sparkles size={12} />
+          </div>
+          <div className="rounded-2xl rounded-tl-sm border border-border bg-card px-3.5 py-2.5 text-foreground shadow-xs flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-0.3s]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce [animation-delay:-0.15s]" />
+            <span className="w-1.5 h-1.5 rounded-full bg-primary/70 animate-bounce" />
+          </div>
         </div>
       )}
 

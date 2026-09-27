@@ -11,4 +11,8 @@ export type {
   EditPlanEntry,
   JobStatus,
   ChatResponse,
+  Conversation,
+  ConversationTurn,
+  StreamEvent,
+  ConversationSummary,
 } from "./api";

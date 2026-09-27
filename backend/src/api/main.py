@@ -27,6 +27,7 @@ from src.models.schemas import (
     ChatResponse
 )
 from src.services.orchestrator import VideoOrchestrator
+from src.api.routes.conversations import router as conversations_router
 
 
 app = FastAPI(
@@ -43,6 +44,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount conversation router
+app.include_router(conversations_router, prefix=settings.API_V1_PREFIX)
 
 orchestrator = VideoOrchestrator()
 

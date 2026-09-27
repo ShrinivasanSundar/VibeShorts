@@ -12,6 +12,10 @@ from .schemas import (
     PatchType,
     ReviewPatch,
     ChatMessage,
+    ConversationTurn,
+    Conversation,
+    StreamEvent,
+    SendMessageRequest,
 )
 
 __all__ = [
@@ -27,4 +31,8 @@ __all__ = [
     "PatchType",
     "ReviewPatch",
     "ChatMessage",
+    "ConversationTurn",
+    "Conversation",
+    "StreamEvent",
+    "SendMessageRequest",
 ]

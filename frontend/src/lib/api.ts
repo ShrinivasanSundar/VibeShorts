@@ -1,8 +1,13 @@
 /**
- * VibeShorts Backend API Client & SSE Event Stream Manager.
+ * VibeShorts Backend API Client.
+ *
+ * Supports both the new conversation-based API (SSE streaming)
+ * and legacy endpoints for backward compatibility.
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+
+// ─── Shared Types ──────────────────────────────────────────────────
 
 export interface CreativeBrief {
   product_name: string;
@@ -43,6 +48,49 @@ export interface JobStatus {
   error?: string;
 }
 
+// ─── Conversation Types ────────────────────────────────────────────
+
+export interface ConversationTurn {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp: string;
+  action?: string | null;
+  plan_snapshot_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface Conversation {
+  conversation_id: string;
+  project_id: string;
+  turns: ConversationTurn[];
+  current_plan?: EditPlan | null;
+  current_brief?: CreativeBrief | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StreamEvent {
+  event_type: "token" | "action" | "plan_update" | "error" | "done";
+  content?: string | null;
+  action?: string | null;
+  plan?: EditPlan | null;
+  brief?: CreativeBrief | null;
+  turn_id?: string | null;
+  suggested_prompts?: string[];
+}
+
+export interface ConversationSummary {
+  conversation_id: string;
+  project_id: string;
+  created_at: string;
+  updated_at: string;
+  turn_count: number;
+  has_plan: boolean;
+}
+
+// ─── Health Check ──────────────────────────────────────────────────
+
 export async function checkBackendHealth(): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/health`);
@@ -51,6 +99,197 @@ export async function checkBackendHealth(): Promise<boolean> {
     return false;
   }
 }
+
+// ─── Conversation API ──────────────────────────────────────────────
+
+export async function createConversation(
+  projectId: string,
+  brief?: CreativeBrief | null
+): Promise<Conversation> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, brief }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to create conversation: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function getConversation(conversationId: string): Promise<Conversation> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}`);
+  if (!res.ok) {
+    throw new Error(`Failed to get conversation: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function listConversations(projectId: string): Promise<ConversationSummary[]> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations?project_id=${projectId}`);
+  if (!res.ok) {
+    throw new Error(`Failed to list conversations: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function deleteConversation(conversationId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok && res.status !== 204) {
+    throw new Error(`Failed to delete conversation: ${res.statusText}`);
+  }
+}
+
+// ─── Send Message (POST) ──────────────────────────────────────────
+
+export async function sendConversationMessage(
+  conversationId: string,
+  message: string
+): Promise<{ status: string; conversation_id: string }> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to send message: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// ─── SSE Stream Subscription ──────────────────────────────────────
+
+export interface StreamCallbacks {
+  onToken?: (text: string, turnId?: string) => void;
+  onAction?: (action: string, prompts: string[], turnId?: string) => void;
+  onPlanUpdate?: (plan: EditPlan, action?: string) => void;
+  onError?: (error: string) => void;
+  onDone?: (prompts: string[], turnId?: string) => void;
+  onConnected?: () => void;
+}
+
+export function subscribeToConversationStream(
+  conversationId: string,
+  callbacks: StreamCallbacks
+): () => void {
+  const eventSource = new EventSource(
+    `${API_BASE}/api/v1/conversations/${conversationId}/stream`
+  );
+
+  eventSource.addEventListener("connected", () => {
+    callbacks.onConnected?.();
+  });
+
+  eventSource.addEventListener("token", (e) => {
+    try {
+      const data: StreamEvent = JSON.parse(e.data);
+      callbacks.onToken?.(data.content || "", data.turn_id || undefined);
+    } catch (err) {
+      console.error("Failed to parse token event:", err);
+    }
+  });
+
+  eventSource.addEventListener("action", (e) => {
+    try {
+      const data: StreamEvent = JSON.parse(e.data);
+      callbacks.onAction?.(
+        data.action || "advice",
+        data.suggested_prompts || [],
+        data.turn_id || undefined
+      );
+    } catch (err) {
+      console.error("Failed to parse action event:", err);
+    }
+  });
+
+  eventSource.addEventListener("plan_update", (e) => {
+    try {
+      const data: StreamEvent = JSON.parse(e.data);
+      if (data.plan) {
+        callbacks.onPlanUpdate?.(data.plan, data.action || undefined);
+      }
+    } catch (err) {
+      console.error("Failed to parse plan_update event:", err);
+    }
+  });
+
+  eventSource.addEventListener("error", (e) => {
+    if (e instanceof MessageEvent) {
+      try {
+        const data: StreamEvent = JSON.parse(e.data);
+        callbacks.onError?.(data.content || "Unknown error");
+      } catch {
+        callbacks.onError?.("Stream error");
+      }
+    }
+  });
+
+  eventSource.addEventListener("done", (e) => {
+    try {
+      const data: StreamEvent = JSON.parse(e.data);
+      callbacks.onDone?.(data.suggested_prompts || [], data.turn_id || undefined);
+    } catch (err) {
+      console.error("Failed to parse done event:", err);
+    }
+  });
+
+  eventSource.addEventListener("heartbeat", () => {
+    // Keep-alive, no action needed
+  });
+
+  eventSource.onerror = () => {
+    // EventSource auto-reconnects on error, which is the desired behavior
+    console.warn("SSE connection error, will auto-reconnect...");
+  };
+
+  // Return cleanup function
+  return () => {
+    eventSource.close();
+  };
+}
+
+// ─── Plan Management ──────────────────────────────────────────────
+
+export async function getConversationPlan(
+  conversationId: string
+): Promise<{ plan: EditPlan | null }> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/plan`);
+  if (!res.ok) {
+    throw new Error(`Failed to get plan: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function updateConversationPlan(
+  conversationId: string,
+  plan: EditPlan
+): Promise<{ status: string; plan: EditPlan }> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/plan`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plan }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to update plan: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function triggerConversationRender(
+  conversationId: string
+): Promise<{ status: string; video_url: string; plan: EditPlan }> {
+  const res = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/render`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to trigger render: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// ─── Legacy API (kept for backward compatibility) ──────────────────
 
 export async function uploadFootage(projectId: string, files: File[]): Promise<{ uploaded_count: number; files: string[] }> {
   const formData = new FormData();
@@ -149,10 +388,10 @@ export async function sendChatMessage(
       return await res.json();
     }
   } catch {
-    // Backend offline: proceed to intelligent local client simulation
+    // fallback below
   }
 
-  // Intelligent client-side director simulation for seamless offline testing
+  // Offline simulation fallback
   const lower = message.toLowerCase();
   let updatedPlan = editPlan ? JSON.parse(JSON.stringify(editPlan)) : null;
   let updatedBrief = brief ? JSON.parse(JSON.stringify(brief)) : null;
@@ -167,7 +406,7 @@ export async function sendChatMessage(
       cut.out_point_sec = Number((cut.in_point_sec + newDur).toFixed(1));
       updatedPlan.revision = (updatedPlan.revision || 1) + 1;
       updatedPlan.total_target_duration = Number(
-        updatedPlan.cuts.reduce((acc: number, c: any) => acc + (c.out_point_sec - c.in_point_sec), 0).toFixed(1)
+        updatedPlan.cuts.reduce((acc: number, c: EditPlanEntry) => acc + (c.out_point_sec - c.in_point_sec), 0).toFixed(1)
       );
       reply = `⚡ Trimmed Cut #1 hook down to ${newDur}s for tighter viral pacing and higher initial retention!`;
       action = "plan_updated";
@@ -199,7 +438,7 @@ export async function sendChatMessage(
       reply = "Add multiple cuts to your video project to swap or rearrange their timeline order.";
     }
   } else if (["energetic", "dramatic", "educational", "humorous", "minimalist"].some((t) => lower.includes(t))) {
-    const tone = ["energetic", "dramatic", "educational", "humorous", "minimalist"].find((t) => lower.includes(t)) as any;
+    const tone = ["energetic", "dramatic", "educational", "humorous", "minimalist"].find((t) => lower.includes(t)) as CreativeBrief["tone"];
     if (updatedBrief) {
       updatedBrief.tone = tone;
     }
@@ -261,4 +500,3 @@ export async function getProjectCatalog(projectId: string): Promise<{ files: str
   }
   return { files: [], count: 0 };
 }
-
