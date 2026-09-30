@@ -1,1 +1,0 @@
-"""VibeShorts core package."""
