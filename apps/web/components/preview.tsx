@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { Play, Pause, Maximize2 } from "lucide-react";
+import { Brand } from "./brand";
 import { useStudio } from "../lib/studio-store";
 import { call } from "../lib/api";
 
@@ -27,7 +28,7 @@ export function CompositionPreview({projectId,artifactId}:{projectId:string;arti
   useEffect(()=>{if(s.playing)player.current?.play();else player.current?.pause();},[s.playing]);
   useEffect(()=>{if(player.current&&!s.playing)player.current.seek(s.time);},[s.time,s.playing]);
   return <section className="preview-area"><div className="preview-mat"><div className={`preview-canvas ${s.timeline.aspect_ratio==="16:9"?"landscape":""}`} ref={container}/>
-    {!artifactId&&<div className="preview-placeholder"><span className="preview-symbol">V</span><h2>Your story, in motion.</h2><p>Start with a brief, or build your own cut.<br/>Your composition will appear here.</p><div className="preview-grid"/></div>}
+    {!artifactId&&<div className="preview-placeholder"><span className="preview-symbol"><Brand compact /></span><span className="eyebrow preview-eyebrow">THINK IT. MAKE IT MOVE.</span><h2>Your story, in motion.</h2><p>Start with a brief, or build your own cut.<br/>Your composition will appear here.</p><div className="preview-grid"/></div>}
     {artifactId&&!ready&&!error&&<div className="preview-loading" role="status">Loading private composition…</div>}
     {error&&<p className="error">{error}</p>}
   </div><div className="transport"><button title={s.playing?"Pause":"Play"} disabled={!artifactId||!ready} onClick={()=>s.play(!s.playing)}>{s.playing?<Pause size={18}/>:<Play size={18}/>}</button>
