@@ -1,0 +1,18 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function projectReader(projectId) {
+      return request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.access_enabled == true
+        && request.auth.uid in get(/databases/$(database)/documents/projects/$(projectId)).data.members;
+    }
+    match /projects/{projectId} {
+      allow get: if projectReader(projectId);
+      allow list, write: if false;
+      match /run_summaries/{runId} { allow read: if projectReader(projectId); allow write: if false; }
+      match /brands/{brandId} { allow read: if projectReader(projectId); allow write: if false; }
+
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

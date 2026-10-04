@@ -1,0 +1,16 @@
+.git
+.venv
+.cache
+**/node_modules
+**/.next
+.env
+**/.env.local
+**/__pycache__
+**/*.pyc
+**/*-debug.log
+tests
+utils
+
+**/.venv
+infrastructure/production.env
+.env.production

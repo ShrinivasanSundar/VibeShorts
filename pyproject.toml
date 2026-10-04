@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibeshorts"
+version = "0.1.0"
+description = "MCP-first recoverable image generation"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "mcp[cli]==2.2.0",
+  "fastapi==0.128.2",
+  "pydantic==2.12.5",
+  "pydantic-settings>=2.12,<3",
+  "uvicorn>=0.40,<1",
+  "httpx>=0.28,<1",
+  "firebase-admin>=7.1,<8",
+  "google-cloud-firestore>=2.21,<3",
+  "google-cloud-storage>=3.7,<4",
+  "google-cloud-pubsub>=2.34,<3",
+  "google-genai==2.25.0",
+  "Pillow>=12.1,<13",
+  "python-multipart>=0.0.22,<1",
+  "google-auth>=2.47,<3",
+  "fonttools[woff]>=4.61,<5",
+]
+
+[project.scripts]
+vibeshorts = "execution.cli:main"
+vibeshorts-mcp = "vibeshorts_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "pytest-asyncio>=1.3,<2", "ruff>=0.15,<1"]
+
+[tool.setuptools]
+packages = ["apps", "apps.api", "tools", "tools.contracts", "tools.bindings", "tools.media", "tools.composition", "execution", "providers", "worker", "vibeshorts_mcp"]
+package-dir = { vibeshorts_mcp = "mcp/vibeshorts_mcp" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["emulator: requires the Firebase emulator suite", "paid: opt-in live provider test"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["utils"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+extend-safe-fixes = ["UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]

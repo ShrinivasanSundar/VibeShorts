@@ -1,0 +1,13 @@
+{
+  "schedule": "* * * * *",
+  "timeZone": "UTC",
+  "attemptDeadline": "300s",
+  "httpTarget": {
+    "uri": "https://YOUR_API_ORIGIN/internal/reconcile",
+    "httpMethod": "POST",
+    "oidcToken": {
+      "serviceAccountEmail": "vibeshorts-scheduler@YOUR_PROJECT.iam.gserviceaccount.com",
+      "audience": "https://YOUR_API_ORIGIN"
+    }
+  }
+}

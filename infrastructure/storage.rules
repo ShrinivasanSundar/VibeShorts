@@ -1,0 +1,7 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // App-authorized object-scoped URLs or authenticated API delivery only.
+    match /{object=**} { allow read, write: if false; }
+  }
+}
