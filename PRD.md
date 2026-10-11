@@ -306,8 +306,8 @@ These stages reconcile the original phase roadmap with the newer implementation 
 | [COMPATIBILITY.md](docs/COMPATIBILITY.md) | Pinned compatibility baseline, protocol behavior, historical local acceptance, and upgrade caveats |
 | [VALIDATION.md](docs/VALIDATION.md) | Recorded 4 October 2026 verification and explicit untested areas |
 | [Director policy](skills/product_launch/director.md) | Scene/copy constraints, exact brand overlays, policy intent, continuity ordering, and approval boundaries |
-| [Web AGENTS.md](apps/web/AGENTS.md) and [CLAUDE.md](apps/web/CLAUDE.md) | Framework-specific contributor instructions; no additional product scope |
-| [Space Grotesk license](apps/web/app/fonts/Space-Grotesk-OFL.txt) and [DM Sans license](apps/web/app/fonts/DM-Sans-OFL.txt) | Font-distribution notice requirements |
+| [Web AGENTS.md](frontend/AGENTS.md) and [CLAUDE.md](frontend/CLAUDE.md) | Framework-specific contributor instructions; no additional product scope |
+| [Space Grotesk license](frontend/app/fonts/Space-Grotesk-OFL.txt) and [DM Sans license](frontend/app/fonts/DM-Sans-OFL.txt) | Font-distribution notice requirements |
 
 When sources differ, this PRD uses the newer Studio/validation record for implementation status and the main specification for normative contracts. Specifically:
 

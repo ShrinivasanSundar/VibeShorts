@@ -8,6 +8,7 @@ node_modules/
 .next/
 .env
 .env.local
+.env.*.local
 .env.production
 !.env.example
 firebase-debug.log

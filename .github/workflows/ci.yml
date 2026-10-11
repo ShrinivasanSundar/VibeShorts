@@ -16,14 +16,15 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with: {version: '0.10.0', enable-cache: true}
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - run: uv sync --frozen
-      - run: uv sync --project agents/creative_director --frozen
-      - run: agents/creative_director/.venv/bin/python scripts/test-adk-sessions.py
+      - run: uv sync --project backend --frozen
+      - run: uv sync --project backend/agents/creative_director --frozen
+      - run: backend/agents/creative_director/.venv/bin/python backend/scripts/test-adk-sessions.py
       - run: npm ci
+      - run: npm run check:integrations -- --backend-env backend/.env.example --frontend-env frontend/.env.example
       - run: npx playwright install-deps chromium
       - run: node_modules/.bin/hyperframes browser ensure
-      - run: uv run ruff check apps tools execution providers worker mcp tests agents sessions scripts
-      - run: uv run ruff format --check apps tools execution providers worker mcp tests agents sessions scripts
-      - run: uv run pytest -q -m 'not emulator and not paid'
+      - run: uv run --directory backend ruff check api tools execution providers worker mcp tests agents sessions scripts
+      - run: uv run --directory backend ruff format --check api tools execution providers worker mcp tests agents sessions scripts
+      - run: uv run --directory backend pytest -q -m 'not emulator and not paid'
       - run: npm run check:web && npm run build:web
       - run: npm run test:emulators

@@ -764,24 +764,46 @@ Repository structure:
 
 ```text
 vibeshorts/
-├── apps/
-│   ├── web/                       Firebase sign-in, preview, approvals, Studio
-│   └── api/                       Firebase verification, REST, OAuth identity bridge
-├── mcp/vibeshorts_mcp/             transport and schemas, built first
-├── tools/
-│   ├── contracts/                 common typed commands/results and errors
-│   ├── bindings/                  native ADK and MCP adapters
-│   ├── media/
-│   └── composition/
-├── agents/creative_director/       ADK App and result/resume bridge
-├── sessions/firestore/             project-owned BaseSessionService adapter
-├── execution/                     jobs, leases, outbox, ledger, reconciliation
-├── worker/                        internal provider/preparation handlers
-├── providers/                     image, Veo, Lyria; explicit route adapters
-├── skills/product_launch/         versioned creative policy
-├── compositions/                  candidate workspaces; immutable packages in GCS
-└── infrastructure/                Firebase rules, IAM, Cloud Run, queue, scheduler
+├── frontend/                      Next.js Studio, Firebase sign-in, preview, approvals
+│   ├── app/                       routes, layout, styles and fonts
+│   ├── components/                Studio, timeline, preview and authentication UI
+│   ├── lib/                       API client, Firebase, state and TypeScript types
+│   └── public/                    static assets
+├── backend/                       Python application and isolated ADK environment
+│   ├── api/                       FastAPI REST endpoints and OAuth identity bridge
+│   ├── mcp/vibeshorts_mcp/         MCP transport using the shared commands
+│   ├── tools/                     contracts, commands, media and composition logic
+│   ├── agents/creative_director/   ADK director with its own pyproject.toml and uv.lock
+│   ├── sessions/firestore/        project-owned ADK session service and result bridge
+│   ├── execution/                 runtime, jobs, leases, outbox, ledger and recovery
+│   ├── worker/                    provider execution and isolated render entry point
+│   ├── providers/                 image, Veo, Lyria and rendering adapters
+│   ├── skills/product_launch/     versioned creative policy
+│   ├── compositions/              candidate workspaces; immutable packages in GCS
+│   ├── scripts/                   Python acceptance and ADK session checks
+│   ├── tests/                     backend, transport, emulator and browser rules tests
+│   ├── utils/                     development utilities
+│   ├── pyproject.toml             backend dependencies and CLI entry points
+│   └── uv.lock                    pinned backend dependency versions
+├── scripts/                       root development and emulator launchers
+├── docs/                          setup, workflow and validation guides
+├── infrastructure/                Firebase rules, Docker, Cloud Run, queue, scheduler
+├── package.json                   frontend workspace and shared Node/render tooling
+└── package-lock.json              pinned Node dependency versions
 ```
+
+Run setup commands from the repository root. Install Python dependencies with `uv sync --project backend --frozen` and `uv sync --project backend/agents/creative_director --frozen`; install Node dependencies with `npm ci`. Use `uv run --directory backend <command>` for backend commands and `npm run dev:web` for the frontend. After starting `npm run emulators`, `bash scripts/dev.sh` starts both apps and the local queue worker. Backend environment files live in `backend/`; frontend browser configuration lives in `frontend/.env.local`. Shared Node dependencies remain at the root because the backend also uses HyperFrames for packaging and rendering.
+
+For production, maintain only `backend/.env.production` and `frontend/.env.production.local`.
+Their templates live beside them: [backend production example](backend/.env.production.example)
+and [frontend production example](frontend/.env.production.example). `infrastructure/` contains
+deployment templates and has no separate env file. Run the live `check:integrations` command
+in [SETUP.md](docs/SETUP.md#configuration-files) to verify the two active files agree.
+
+To run both apps on localhost with real Firebase and Vertex, use `npm run dev:live`.
+The explicit `VIBESHORTS_LOCAL_LIVE=1` opt-in allows loopback HTTP and a local pull
+worker while retaining real authentication and cloud services. See
+[local real-service setup](docs/SETUP.md#test-locally-with-real-firebase-and-vertex).
 
 Configure dependencies in lockfiles during implementation. Record tested ADK, Firebase Admin/Web, Google Gen AI SDK, MCP SDK/protocol, HyperFrames/browser, and adapter schema versions. Validate upgrades with emulator/recovery and provider-capability checks; examples here do not substitute for a pinned compatibility record.
 

@@ -5,15 +5,17 @@
     "node": ">=22.19.0"
   },
   "workspaces": [
-    "apps/web"
+    "frontend"
   ],
   "scripts": {
-    "dev:web": "npm run dev --workspace apps/web",
-    "build:web": "npm run build --workspace apps/web",
-    "check:web": "npm run check --workspace apps/web",
+    "dev:web": "npm run dev --workspace frontend",
+    "dev:live": "bash scripts/dev-live.sh",
+    "build:web": "npm run build --workspace frontend",
+    "check:web": "npm run check --workspace frontend",
+    "check:integrations": "uv run --project backend python backend/scripts/check-integrations.py",
     "emulators": "bash scripts/emulators.sh",
     "test:emulators": "bash scripts/emulators.sh test",
-    "test:rules": "node --test tests/rules.test.mjs",
+    "test:rules": "node --test backend/tests/rules.test.mjs",
     "inspector": "mcp-inspector"
   },
   "devDependencies": {

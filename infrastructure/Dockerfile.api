@@ -3,28 +3,20 @@ FROM python:3.12-slim
 COPY --from=uv /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PATH="/app/.venv/bin:$PATH"
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PATH="/app/backend/.venv/bin:$PATH"
+COPY backend/pyproject.toml backend/uv.lock backend/
+RUN uv sync --project backend --frozen --no-dev --no-install-project
 COPY --from=node:22.23.3-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22.23.3-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 COPY package.json package-lock.json ./
-COPY apps/web/package.json apps/web/package.json
+COPY frontend/package.json frontend/package.json
 RUN npm ci --ignore-scripts
-COPY agents/creative_director/pyproject.toml agents/creative_director/uv.lock agents/creative_director/
-RUN uv sync --project agents/creative_director --frozen --no-dev
-COPY agents/creative_director/direct.py agents/creative_director/direct.py
-COPY sessions sessions
-COPY skills skills
-COPY apps/api apps/api
-COPY apps/__init__.py apps/__init__.py
-COPY tools tools
-COPY mcp mcp
-COPY execution execution
-COPY providers providers
-COPY worker worker
-RUN uv sync --frozen --no-dev
+COPY backend/agents/creative_director/pyproject.toml backend/agents/creative_director/uv.lock backend/agents/creative_director/
+RUN uv sync --project backend/agents/creative_director --frozen --no-dev
+COPY backend backend
+RUN uv sync --project backend --frozen --no-dev
+WORKDIR /app/backend
 USER 65532:65532
 EXPOSE 8080
-CMD ["uvicorn", "apps.api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+CMD ["uvicorn", "api.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
