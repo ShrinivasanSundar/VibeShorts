@@ -27,7 +27,9 @@ class Dispatcher:
             if not project.get("project_id"):
                 continue
             project_id = project["project_id"]
-            for item in self.commands.repo.list(project_path(project_id, "outbox")):
+            for item in self.commands.repo.list_where(
+                project_path(project_id, "outbox"), "status", ["pending"]
+            ):
                 if item["status"] != "pending" or item["next_attempt_at"] > self.commands.clock():
                     continue
                 try:
@@ -81,7 +83,19 @@ class Reconciler:
             if not project.get("project_id"):
                 continue
             project_id = project["project_id"]
-            for job in self.commands.repo.list(project_path(project_id, "jobs")):
+            for job in self.commands.repo.list_where(
+                project_path(project_id, "jobs"),
+                "status",
+                [
+                    "queued",
+                    "claimed",
+                    "submitting",
+                    "waiting_for_provider",
+                    "cancel_requested",
+                    "submission_unknown",
+                    "materializing",
+                ],
+            ):
                 if job["status"] in {"succeeded", "failed", "cancelled"}:
                     continue
                 if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
@@ -220,11 +234,18 @@ class EmulatorPump:
         self.bootstrap()
         next_sweep = 0
         while True:
-            if time.time() >= next_sweep:
-                self.reconciler.sweep()
-                next_sweep = time.time() + 60
-            self.once()
-            time.sleep(0.25)
+            from google.api_core.exceptions import ResourceExhausted
+
+            try:
+                if time.time() >= next_sweep:
+                    self.reconciler.sweep()
+                    next_sweep = time.time() + 60
+                self.once()
+            except ResourceExhausted:
+                event("worker_quota_exhausted", retry_after_seconds=60)
+                time.sleep(60)
+                continue
+            time.sleep(5 if self.commands.settings.local_live else 0.25)
 
 
 def reconcile_decision(commands, project_id, job_id, amount_micros, evidence, operator):

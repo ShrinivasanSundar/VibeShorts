@@ -520,6 +520,10 @@ class Commands(StudioCommands):
             if run.get("pending_approval_id")
             else None
         )
+        return self._run_result(run, jobs, approval)
+
+    @staticmethod
+    def _run_result(run, jobs, approval):
         return RunResult(
             **{
                 k: run[k]

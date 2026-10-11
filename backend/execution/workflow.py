@@ -22,7 +22,11 @@ class WorkflowScheduler:
         for project in self.commands.repo.list("projects"):
             if not project.get("project_id"):
                 continue
-            for run in self.commands.repo.list(project_path(project["project_id"], "runs")):
+            for run in self.commands.repo.list_where(
+                project_path(project["project_id"], "runs"),
+                "status",
+                ["queued", "running", "waiting_for_jobs"],
+            ):
                 if run.get("workflow") and run["status"] not in {
                     "cancelled",
                     "failed",

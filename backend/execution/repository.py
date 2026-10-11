@@ -58,6 +58,12 @@ class MemoryRepository:
     def page(self, collection: str, limit: int, after: str = "") -> list[Doc]:
         return [d for d in self.list(collection) if d["id"] > after][:limit]
 
+    def recent(self, collection: str, limit: int) -> list[Doc]:
+        return sorted(self.list(collection), key=lambda d: d.get("created_at", 0), reverse=True)[:limit]
+
+    def list_where(self, collection: str, field: str, values: list) -> list[Doc]:
+        return [d for d in self.list(collection) if d.get(field) in values]
+
 
 class FirestoreRepository:
     def __init__(self, project: str):
@@ -70,6 +76,16 @@ class FirestoreRepository:
 
     def list(self, collection: str) -> list[Doc]:
         return [s.to_dict() for s in self.client.collection(collection).stream()]
+
+    def recent(self, collection: str, limit: int) -> list[Doc]:
+        query = self.client.collection(collection).order_by("created_at", direction="DESCENDING").limit(limit)
+        return [s.to_dict() for s in query.stream()]
+
+    def list_where(self, collection: str, field: str, values: list) -> list[Doc]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        query = self.client.collection(collection).where(filter=FieldFilter(field, "in", values))
+        return [s.to_dict() for s in query.stream()]
 
     def page(self, collection: str, limit: int, after: str = "") -> list[Doc]:
         query = self.client.collection(collection).order_by("__name__").limit(limit)

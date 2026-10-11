@@ -1,6 +1,6 @@
 from tools.composition.package import unpack
 from tools.contracts.errors import AppError
-from tools.contracts.models import GENERATE, DataResult
+from tools.contracts.models import GENERATE, DataResult, JobResult
 
 
 def input_ids(kind, value):
@@ -146,8 +146,10 @@ class StudioCommands:
         from tools.commands import project_path
 
         project = self.authorize(caller, project_id)
-        jobs = self.repo.list(project_path(project_id, "jobs"))
-        runs = self.repo.list(project_path(project_id, "runs"))
+        jobs = self.repo.recent(project_path(project_id, "jobs"), 60)
+        runs = self.repo.recent(project_path(project_id, "runs"), 20)
+        approvals = self.repo.recent(project_path(project_id, "approvals"), 20)
+        approvals_by_id = {a["id"]: a for a in approvals}
         return DataResult(
             data={
                 "project": {
@@ -156,28 +158,24 @@ class StudioCommands:
                 "budget": self.repo.get("budgets/" + project_id),
                 "provider_route": self.settings.provider,
                 "runs": [
-                    self.get_run(caller, project_id, r["run_id"]).model_dump()
-                    for r in sorted(runs, key=lambda r: r.get("created_at", 0), reverse=True)[:20]
+                    self._run_result(
+                        r,
+                        [j for j in jobs if j["run_id"] == r["run_id"]],
+                        approvals_by_id.get(r.get("pending_approval_id")),
+                    ).model_dump()
+                    for r in runs
                 ],
                 "jobs": [
-                    self.get_job(caller, project_id, j["job_id"]).model_dump()
+                    JobResult(**{k: j[k] for k in JobResult.model_fields if k in j}).model_dump()
                     | {"kind": j.get("kind", "image")}
-                    for j in sorted(jobs, key=lambda j: j["created_at"], reverse=True)[:60]
+                    for j in jobs
                 ],
                 "assets": self.list_assets(caller, project_id, 100).model_dump(),
-                "approvals": sorted(
-                    self.repo.list(project_path(project_id, "approvals")),
-                    key=lambda a: a["created_at"],
-                    reverse=True,
-                )[:20],
+                "approvals": approvals,
                 "brand": self.repo.get(
                     project_path(project_id, "brands", f"brand_{project['brand_version']}")
                 ),
-                "events": sorted(
-                    self.repo.list(project_path(project_id, "events")),
-                    key=lambda e: e["created_at"],
-                    reverse=True,
-                )[:60],
+                "events": self.repo.recent(project_path(project_id, "events"), 60),
             }
         )
 

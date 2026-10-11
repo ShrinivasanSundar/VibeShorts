@@ -314,7 +314,7 @@ class StudioProvider:
                     out.setframerate(48000)
                     out.writeframes(samples.tobytes())
                 return ImageOutput(buffer.getvalue(), "audio/wav")
-            return self._music(request, snapshot)
+            return self._music(request, snapshot, job)
         if self.kind in {"prepare", "frame"}:
             _, mime = self.commands.asset_content(caller, job["project_id"], request.artifact_id)
             if self.kind == "frame":
@@ -344,7 +344,7 @@ class StudioProvider:
             return self._render(request, references[0])
         raise AppError("UNSUPPORTED_OPERATION", "Operation is unavailable")
 
-    def _music(self, request, snapshot):
+    def _music(self, request, snapshot, job=None):
         if snapshot["route"] == "vertex":
             import google.auth
             from google.auth.transport.requests import AuthorizedSession
@@ -378,7 +378,32 @@ class StudioProvider:
                         "Music provider rejected the request",
                         uncertain=response.status_code >= 500,
                     )
-                data = base64.b64decode(response.json()["predictions"][0]["audioContent"], validate=True)
+                body = response.json()
+                if job:
+                    self.commands.storage.put(
+                        job["candidate_path"] + ".provider-response.json",
+                        json.dumps(body).encode(),
+                        {
+                            "mime_type": "application/json",
+                            "input_hash": job["input_hash"],
+                            "attempt": job["attempt"],
+                        },
+                    )
+                predictions = body.get("predictions") or []
+                prediction = predictions[0] if predictions else {}
+                encoded = prediction.get("audioContent") or prediction.get("bytesBase64Encoded")
+                if not encoded:
+                    from execution.telemetry import event
+
+                    event(
+                        "music_response_missing_audio",
+                        response_fields=sorted(body),
+                        prediction_fields=sorted(prediction),
+                    )
+                    raise ProviderFailure(
+                        "MISSING_AUDIO", "Music response contained no audio", uncertain=True
+                    )
+                data = base64.b64decode(encoded, validate=True)
                 return ImageOutput(data, "audio/wav")
             finally:
                 session.close()
@@ -445,7 +470,7 @@ class StudioProvider:
                     "--security-opt",
                     "no-new-privileges",
                     "--pids-limit",
-                    "256",
+                    "512",
                     "--memory",
                     "4g",
                     "--cpus",

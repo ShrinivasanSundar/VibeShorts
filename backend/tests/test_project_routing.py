@@ -148,7 +148,8 @@ def test_media_clients_use_snapshotted_ai_project_and_credentials(monkeypatch, k
     assert seen["project"] == "firebase-project"
 
 
-def test_vertex_music_uses_ai_project_and_credentials(monkeypatch):
+@pytest.mark.parametrize("audio_key", ["audioContent", "bytesBase64Encoded"])
+def test_vertex_music_uses_ai_project_and_credentials(monkeypatch, audio_key):
     from google.auth.transport import requests
 
     credentials = object()
@@ -163,7 +164,7 @@ def test_vertex_music_uses_ai_project_and_credentials(monkeypatch):
             seen["url"] = url
             return SimpleNamespace(
                 status_code=200,
-                json=lambda: {"predictions": [{"audioContent": base64.b64encode(b"music").decode()}]},
+                json=lambda: {"predictions": [{audio_key: base64.b64encode(b"music").decode()}]},
             )
 
         def close(self):

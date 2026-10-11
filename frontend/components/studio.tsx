@@ -8,7 +8,7 @@ import { subscribeRunSummaries } from "../lib/realtime";
 import { signOut, type User } from "firebase/auth";
 import { ArrowLeft, Sparkles, Film, Images, Palette, Clock3, Download, Upload, Plus, Save, ChevronRight, Check, X, Loader2, Layers3, Settings2, Music2, Copy, Wand2, CircleHelp, LogOut, Users, Globe2 } from "lucide-react";
 import { firebaseAuth } from "../lib/firebase";
-import { call, request } from "../lib/api";
+import { ApiError, call, request } from "../lib/api";
 import { useStudio } from "../lib/studio-store";
 import { emptyTimeline, type Asset, type Brand, type StudioState, type Timeline, type Clip } from "../lib/studio-types";
 import { CompositionPreview } from "./preview";
@@ -31,7 +31,17 @@ export function Studio({projectId,user}:{projectId:string;user:User}) {
   const [tab,setTab]=useState("brief");const [rightTab,setRightTab]=useState("properties");const [brief,setBrief]=useState("");const [duration,setDuration]=useState(15);const [policy,setPolicy]=useState("product_launch");const [locale,setLocale]=useState("en");const [cap,setCap]=useState("1");
   const [busy,setBusy]=useState(false);const [error,setError]=useState("");const [notice,setNotice]=useState("");const [head,setHead]=useState<string|null>(null);const [brand,setBrand]=useState<Brand>(blankBrand);const [assetFilter,setAssetFilter]=useState("all");const [story,setStory]=useState<{scenes:{id:string;exact_copy:string[];objective:string;editorial_duration_seconds:number}[]}|null>(null);const [reviewId,setReviewId]=useState("");const [editPrompt,setEditPrompt]=useState("");const [batchMode,setBatchMode]=useState(false);const [member,setMember]=useState("");const [role,setRole]=useState("editor");const [assetPreview,setAssetPreview]=useState<{asset:Asset;url:string}|null>(null);
   const uploadRef=useRef<HTMLInputElement>(null);const loadedHead=useRef<string|null>(null);const [moreAssets,setMoreAssets]=useState<Asset[]>([]);const [assetCursor,setAssetCursor]=useState<string|null>(null);const [assetsExhausted,setAssetsExhausted]=useState(false);
-  const {data,isPending,isError,error:queryError,refetch}=useQuery({queryKey:["studio",user.uid,projectId],queryFn:async()=>{const response=await call(`${base}/studio`);return response.data as StudioState;},refetchInterval:2500});
+  const {data,isPending,isError,error:queryError,refetch}=useQuery({
+    queryKey:["studio",user.uid,projectId],
+    queryFn:async()=>{const response=await call(`${base}/studio`);return response.data as StudioState;},
+    retry:(count,error)=>!(error instanceof ApiError && error.status===429) && count<1,
+    refetchInterval:(query)=>{
+      if(query.state.error instanceof ApiError && query.state.error.status===429) return false;
+      const active=["queued","claimed","running","submitting","materializing","waiting_for_provider","waiting_for_jobs","cancel_requested"];
+      const state=query.state.data;
+      return state?.jobs.some(job=>active.includes(job.status)) || state?.runs.some(run=>active.includes(run.status)) ? 15000 : false;
+    },
+  });
   useEffect(()=>subscribeRunSummaries(projectId,()=>{void queryClient.invalidateQueries({queryKey:["studio",user.uid,projectId]});}),[projectId,user.uid,queryClient]);
   useEffect(()=>{s.reset();return()=>{useStudio.getState().reset();};},[projectId,user.uid]); // clear all project-scoped editing state
   useEffect(()=>{if(data?.brand)setBrand(data.brand);},[data?.project.brand_version]);

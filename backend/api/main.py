@@ -91,6 +91,22 @@ def create_app(runtime=None):
             exc.payload.model_dump(exclude_none=True), status_code=exc.status, headers=headers
         )
 
+    from google.api_core.exceptions import ResourceExhausted
+
+    @app.exception_handler(ResourceExhausted)
+    async def quota_error(request, exc):
+        return JSONResponse(
+            {
+                "code": "FIRESTORE_QUOTA_EXHAUSTED",
+                "message": (
+                    "Firestore quota is exhausted. Check Firebase usage and billing, "
+                    "or retry after the quota resets."
+                ),
+            },
+            status_code=429,
+            headers={"Cache-Control": "no-store", "Retry-After": "60"},
+        )
+
     def bearer(authorization):
         if not authorization or not authorization.startswith("Bearer "):
             raise AppError("UNAUTHENTICATED", "Bearer credentials required", 401)
