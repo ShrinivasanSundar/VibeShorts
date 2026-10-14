@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { useShallow } from "zustand/react/shallow";
 import { emptyTimeline, type Timeline } from "./studio-types";
 
 type History = {past: Timeline[]; future: Timeline[]};
@@ -12,3 +13,8 @@ export const useStudio = create<State>((set) => ({timeline:emptyTimeline, select
   select: selected=>set({selected}), seek: time=>set(state=>({time:Math.max(0,Math.min(state.timeline.duration_seconds,time))})), play: playing=>set({playing}), setZoom: zoom=>set({zoom}),
   reset: ()=>set({timeline:emptyTimeline,selected:null,time:0,playing:false,zoom:1,dirty:false,history:{past:[],future:[]}}),
 }));
+
+// Editor chrome and query owners do not subscribe to the player's clock.
+export function useEditor() {
+  return useStudio(useShallow(({ time: _time, playing: _playing, ...editor }) => editor));
+}

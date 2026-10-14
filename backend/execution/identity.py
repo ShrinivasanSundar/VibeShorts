@@ -1,5 +1,6 @@
 import time
 
+from execution.read_context import cached_read
 from tools.contracts.errors import AppError
 from tools.contracts.models import Caller
 
@@ -24,12 +25,17 @@ class FirebaseIdentity:
             if claims.get("firebase", {}).get("sign_in_provider") == "anonymous":
                 raise ValueError("Anonymous sign-in is disabled")
             caller = Caller(uid=claims["uid"], auth_time=claims["auth_time"])
-            self.check_uid(caller.uid, caller.auth_time)
+            # check_revoked already checked the Auth user; share that result only
+            # inside an enclosing read scope, never across requests or workers.
+            cached_read((id(self), caller.uid, caller.auth_time), lambda: None)
             return caller
         except Exception as exc:
             raise AppError("UNAUTHENTICATED", "Valid Firebase credentials are required", 401) from exc
 
     def check_uid(self, uid: str, auth_time: float):
+        return cached_read((id(self), uid, auth_time), lambda: self._check_uid(uid, auth_time))
+
+    def _check_uid(self, uid: str, auth_time: float):
         from firebase_admin import auth
 
         try:

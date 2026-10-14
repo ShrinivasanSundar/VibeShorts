@@ -28,7 +28,7 @@ import { signOut } from "firebase/auth";
 import { firebaseAuth } from "../lib/firebase";
 import { ApiError, call } from "../lib/api";
 import { operationKey, useWorkspace } from "../lib/workspace";
-import { useStudio } from "../lib/studio-store";
+import { useStudio, useEditor } from "../lib/studio-store";
 import type {
   Asset,
   ChatMessage,
@@ -83,7 +83,7 @@ export function ChatWorkspace({
   onMore,
 }: Props) {
   const w = useWorkspace();
-  const s = useStudio();
+  const s = useEditor();
   const [sidebar, setSidebar] = useState(false);
   const [settings, setSettings] = useState(false);
   const [agentOpen, setAgentOpen] = useState(true);
@@ -121,50 +121,7 @@ export function ChatWorkspace({
   const [newMessages, setNewMessages] = useState(false);
   const sendKey = useRef<string | null>(null);
   const lastText = useRef("");
-  const query = useQuery({
-    queryKey: ["conversations", w.user.uid, w.projectId, conversationId],
-    enabled: !!conversationId,
-    queryFn: async () =>
-      (await call(`${w.base}/conversations/${conversationId}?tail=true`))
-        .data as ConversationState,
-    retry: (count, e) =>
-      !(e instanceof ApiError && e.status === 429) && count < 1,
-    refetchInterval: (q) =>
-      q.state.error instanceof ApiError && q.state.error.status === 429
-        ? false
-        : q.state.data?.operations?.some(
-              (j) => j.status === "submission_unknown",
-            ) ||
-            q.state.data?.messages.some(
-              (m) => m.status === "needs_reconciliation",
-            )
-          ? 15000
-          : q.state.data?.messages.some((m) =>
-                ["queued", "running"].includes(m.status || ""),
-              ) ||
-              q.state.data?.operations?.some(
-                (j) =>
-                  ![
-                    "succeeded",
-                    "failed",
-                    "cancelled",
-                    "submission_unknown",
-                  ].includes(j.status),
-              ) ||
-              w.data?.jobs.some(
-                (j) =>
-                  ![
-                    "succeeded",
-                    "failed",
-                    "cancelled",
-                    "submission_unknown",
-                  ].includes(j.status),
-              )
-            ? 2500
-            : activeStates.includes(q.state.data?.run?.status || "")
-              ? 5000
-              : false,
-  });
+  const query = w.conversationQuery;
   useEffect(() => {
     setSidebar(false);
   }, []);
@@ -238,10 +195,6 @@ export function ChatWorkspace({
       return () => clearTimeout(timer);
     }
   }, [canvas]);
-  useEffect(() => {
-    const head = query.data?.conversation.composition_head;
-    if (head && head !== w.data?.project.composition_head) void w.refresh();
-  }, [query.data?.conversation.composition_head]);
   const previousHead = useRef<string | null>(null);
   useEffect(() => {
     const head = query.data?.conversation.composition_head;
@@ -277,7 +230,7 @@ export function ChatWorkspace({
         ),
     );
   async function refresh() {
-    await Promise.all([w.refresh(), query.refetch()]);
+    await w.refresh();
   }
   async function send() {
     if (!text.trim() || w.busy) return;
@@ -326,7 +279,6 @@ export function ChatWorkspace({
       setAttachments([]);
       sendKey.current = null;
       atBottom.current = true;
-      await refresh();
     });
   }
   async function accept(approvalId: string, target: string) {
@@ -346,7 +298,6 @@ export function ChatWorkspace({
           composition_artifact_id: target,
           quality: "final",
         });
-      await refresh();
     });
   }
   async function download(id: string) {
@@ -379,8 +330,7 @@ export function ChatWorkspace({
     if (s.dirty) {
       await w.action(async () => {
         await w.save();
-        await refresh();
-        setCanvas(false);
+          setCanvas(false);
         w.setNotice(
           "Your new revision is saved. Review it, then approve and export.",
         );
@@ -416,7 +366,6 @@ export function ChatWorkspace({
         w.setNotice(
           "Review this exact version, then choose Approve and export.",
         );
-      await refresh();
     });
   }
   const currentHead = query.data?.conversation.composition_head;
@@ -744,8 +693,7 @@ export function ChatWorkspace({
                                       }),
                                     },
                                   );
-                                  await refresh();
-                                })
+                                                            })
                             : undefined
                         }
                         currentStoryboard={
@@ -876,8 +824,7 @@ export function ChatWorkspace({
                             }),
                           },
                         );
-                        await refresh();
-                      })
+                                        })
                     }
                   >
                     Retry failed step
@@ -1085,8 +1032,7 @@ export function ChatWorkspace({
                           }),
                         },
                       );
-                      await refresh();
-                    })
+                                    })
                   }
                 >
                   <Square size={16} />

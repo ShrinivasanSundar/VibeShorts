@@ -1,3 +1,4 @@
+from execution.read_context import read_command
 from tools.composition.package import unpack
 from tools.contracts.errors import AppError
 from tools.contracts.models import GENERATE, DataResult, JobResult
@@ -114,10 +115,12 @@ class StudioCommands:
 
         return DataResult(data={"artifact_ids": invalidation(self, project_id, [artifact_id])})
 
+    @read_command
     def inspect_media(self, caller, project_id, artifact_id):
         self.authorize(caller, project_id)
         return DataResult(data=self._artifact(project_id, artifact_id)["media"])
 
+    @read_command
     def get_hyperframe(self, caller, project_id, artifact_id=None, conversation_id=None):
         project = (
             self.conversation(caller, project_id, conversation_id)
@@ -140,6 +143,7 @@ class StudioCommands:
             }
         )
 
+    @read_command
     def get_storyboard(self, caller, project_id, artifact_id):
         from tools.contracts.studio import Storyboard
 
@@ -149,35 +153,35 @@ class StudioCommands:
         data, _ = self.asset_content(caller, project_id, artifact_id)
         return DataResult(data=Storyboard.model_validate_json(data).model_dump())
 
-    def studio_state(self, caller, project_id, conversation_id=None):
+    @read_command
+    def studio_state(
+        self, caller, project_id, conversation_id=None, include_history=True, include_assets=True
+    ):
         from tools.commands import project_path
 
         project = self.authorize(caller, project_id)
-        jobs = self.repo.recent(project_path(project_id, "jobs"), 60)
-        runs = self.repo.recent(project_path(project_id, "runs"), 20)
-        approvals = self.repo.recent(project_path(project_id, "approvals"), 20)
-        approvals_by_id = {a["id"]: a for a in approvals}
-        if conversation_id:
-            conversation = self.conversation(caller, project_id, conversation_id)
+        conversation = self.conversation(caller, project_id, conversation_id) if conversation_id else None
+        if conversation:
             project = {**project, "composition_head": conversation.get("composition_head")}
-            jobs = sorted(
-                self.repo.list_where(project_path(project_id, "jobs"), "conversation_id", [conversation_id]),
-                key=lambda j: j["created_at"],
-                reverse=True,
-            )[:60]
-            runs = sorted(
-                self.repo.list_where(project_path(project_id, "runs"), "conversation_id", [conversation_id]),
-                key=lambda r: r["created_at"],
-                reverse=True,
-            )[:20]
-            approvals = sorted(
-                self.repo.list_where(
-                    project_path(project_id, "approvals"), "conversation_id", [conversation_id]
-                ),
-                key=lambda a: a["created_at"],
-                reverse=True,
-            )[:20]
-            approvals_by_id = {a["id"]: a for a in approvals}
+
+        def history(collection, limit):
+            if not include_history:
+                return []
+            filters = [("conversation_id", "==", conversation_id)] if conversation_id else []
+            return self.repo.query(
+                project_path(project_id, collection),
+                filters=filters,
+                order=[("created_at", True)],
+                limit=limit,
+            )
+
+        jobs, runs, approvals = history("jobs", 60), history("runs", 20), history("approvals", 20)
+        if include_history and conversation and conversation.get("active_run_id"):
+            if not any(r["run_id"] == conversation["active_run_id"] for r in runs):
+                active = self.repo.get(project_path(project_id, "runs", conversation["active_run_id"]))
+                if active:
+                    runs = [active, *runs[:19]]
+        approvals_by_id = {a["id"]: a for a in approvals}
         return DataResult(
             data={
                 "project": {
@@ -198,12 +202,14 @@ class StudioCommands:
                     | {"kind": j.get("kind", "image")}
                     for j in jobs
                 ],
-                "assets": self.list_assets(caller, project_id, 100).model_dump(),
+                "assets": self.list_assets(caller, project_id, 20).model_dump()
+                if include_assets
+                else {"assets": [], "next_cursor": None},
                 "approvals": approvals,
                 "brand": self.repo.get(
                     project_path(project_id, "brands", f"brand_{project['brand_version']}")
                 ),
-                "events": self.repo.recent(project_path(project_id, "events"), 60),
+                "events": self.repo.recent(project_path(project_id, "events"), 60) if include_history else [],
             }
         )
 
@@ -368,6 +374,7 @@ class StudioCommands:
 
         return DataResult(data=self.repo.atomic(apply))
 
+    @read_command
     def brand_assessment(self, caller, project_id, artifact_id):
         self.authorize(caller, project_id)
         artifact = self._artifact(project_id, artifact_id)

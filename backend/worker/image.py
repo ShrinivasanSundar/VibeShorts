@@ -1,3 +1,4 @@
+import hashlib
 import threading
 
 from execution.telemetry import event
@@ -43,9 +44,15 @@ class ImageWorker:
                 return None
             job["generation"] += 1
             job["lease_owner"], job["lease_expires_at"] = owner, now + self.commands.settings.lease_seconds
-            self.commands.transition(
-                tx, job, "materializing" if job["status"] == "materializing" else "claimed"
-            )
+            if job.get("provider_operation") and job["status"] in {
+                "waiting_for_provider",
+                "cancel_requested",
+            }:
+                tx.set(project_path(project_id, "jobs", job_id), job)
+            else:
+                self.commands.transition(
+                    tx, job, "materializing" if job["status"] == "materializing" else "claimed"
+                )
             return job
 
         return self.repo.atomic(apply)
@@ -97,10 +104,12 @@ class ImageWorker:
             ):
                 raise AppError("PROVIDER_UNAVAILABLE", "Accepted provider route is not configured", 503)
             request = (ImageInput if kind == "image" else INPUTS[kind])(**job["input"])
-            references = [
-                self.commands.asset_content(caller, project_id, a)[0]
-                for a in job.get("input_artifacts", request.reference_artifact_ids)
-            ]
+            references = []
+            if not (kind in {"video", "render"} and job.get("provider_operation")):
+                references = [
+                    self.commands.asset_content(caller, project_id, a)[0]
+                    for a in job.get("input_artifacts", request.reference_artifact_ids)
+                ]
 
             def submitting(tx):
                 current = self._current(tx, job)
@@ -206,10 +215,17 @@ class ImageWorker:
     def wait_for_provider(self, claimed, operation):
         def apply(tx):
             current = self._current(tx, claimed)
+            unchanged = current.get("provider_operation") == operation
+            attempt = current.get("poll_attempt", 0) + 1 if unchanged else 0
+            current["poll_attempt"] = attempt
             current["provider_operation"] = operation
             current["lease_owner"], current["lease_expires_at"] = None, 0
-            current["next_poll_at"] = self.commands.clock() + 10
-            self.commands.transition(tx, current, "waiting_for_provider")
+            jitter = int(hashlib.sha256(f"{current['job_id']}:{attempt}".encode()).hexdigest()[:4], 16) % 4
+            current["next_poll_at"] = self.commands.clock() + min(60, 15 * 2 ** min(attempt, 2)) + jitter
+            if current["status"] in {"waiting_for_provider", "cancel_requested"}:
+                tx.set(project_path(current["project_id"], "jobs", current["job_id"]), current)
+            else:
+                self.commands.transition(tx, current, "waiting_for_provider")
             path = project_path(current["project_id"], "outbox", current["job_id"])
             tx.set(
                 path,

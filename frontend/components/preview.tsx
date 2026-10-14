@@ -8,7 +8,7 @@ import { claimPlayback } from "./private-media";
 
 type Player = HTMLElement & {play:()=>void;pause:()=>void;seek:(time:number)=>void;currentTime:number;srcdoc:string;iframeElement?:HTMLIFrameElement};
 export function CompositionPreview({projectId,artifactId,independent=false}:{projectId:string;artifactId:string|null;independent?:boolean}) {
-  const container=useRef<HTMLDivElement>(null);const player=useRef<Player|null>(null);const studio=useStudio();const [error,setError]=useState("");const [ready,setReady]=useState(false);
+  const lastTime=useRef(0);const container=useRef<HTMLDivElement>(null);const player=useRef<Player|null>(null);const studio=useStudio();const [error,setError]=useState("");const [ready,setReady]=useState(false);
   const [localTime,setLocalTime]=useState(0);const [localPlaying,setLocalPlaying]=useState(false);
   const [profile,setProfile]=useState({aspect_ratio:"9:16",duration_seconds:15});
   const s=independent?{time:localTime,playing:localPlaying,play:setLocalPlaying,seek:setLocalTime,timeline:profile,dirty:false}:studio;
@@ -24,7 +24,7 @@ export function CompositionPreview({projectId,artifactId,independent=false}:{pro
       element.style.width="100%";element.style.height="100%";
       element.addEventListener("ready",()=>active&&setReady(true));
       element.addEventListener("error",()=>active&&setError("Preview could not be loaded. Try the draft export."));
-      element.addEventListener("timeupdate",()=>{if(active){if(independent)setLocalTime(element.currentTime);else useStudio.getState().seek(element.currentTime);}});
+      element.addEventListener("timeupdate",()=>{if(active && performance.now()-lastTime.current>=100){lastTime.current=performance.now();if(independent)setLocalTime(element.currentTime);else useStudio.getState().seek(element.currentTime);}});
       element.addEventListener("ended",()=>independent?setLocalPlaying(false):useStudio.getState().play(false));
       container.current.replaceChildren(element);player.current=element;
     }catch(e){if(active)setError((e as Error).message);}}

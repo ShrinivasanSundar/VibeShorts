@@ -1,7 +1,10 @@
 """Project-owned conversations. Jobs remain authoritative for execution and media."""
 
+import base64
 import hashlib
+import json
 
+from execution.read_context import read_command
 from tools.contracts.errors import AppError
 from tools.contracts.models import CANCEL, GENERATE, Caller, DataResult
 from tools.contracts.studio import (
@@ -176,23 +179,48 @@ class ConversationCommands:
 
         return DataResult(data=self.repo.atomic(apply))
 
+    @read_command
     def list_conversations(self, caller, project, limit=30, cursor=None):
         from tools.commands import project_path
 
         self.authorize(caller, project)
-        docs = sorted(
-            self.repo.list(project_path(project, "conversations")),
-            key=lambda d: (d["updated_at"], d["id"]),
-            reverse=True,
-        )
+        collection = project_path(project, "conversations")
+        after = None
         if cursor:
-            index = next((i for i, d in enumerate(docs) if d["id"] == cursor), None)
-            docs = docs[index + 1 :] if index is not None else []
-        page = docs[:limit]
-        return DataResult(
-            data={"conversations": page, "next_cursor": page[-1]["id"] if len(docs) > limit else None}
-        )
+            if cursor.startswith("v2:"):
+                try:
+                    value = json.loads(base64.urlsafe_b64decode(cursor[3:]))
+                    if value["project"] != project or not isinstance(value["updated_at"], (float, int)):
+                        raise ValueError("Cursor scope mismatch")
+                    from tools.commands import checked_id
 
+                    after = {"updated_at": value["updated_at"], "__name__": checked_id(value["id"])}
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise AppError("INVALID_INPUT", "Invalid conversation cursor") from exc
+            else:
+                from tools.commands import checked_id
+
+                old = self.repo.get(collection + "/" + checked_id(cursor))
+                if not old:
+                    return DataResult(data={"conversations": [], "next_cursor": None})
+                after = {"updated_at": old["updated_at"], "__name__": old["id"]}
+        docs = self.repo.query(
+            collection, order=[("updated_at", True), ("__name__", True)], limit=limit + 1, after=after
+        )
+        page = docs[:limit]
+        next_cursor = None
+        if len(docs) > limit:
+            next_cursor = (
+                "v2:"
+                + base64.urlsafe_b64encode(
+                    json.dumps(
+                        {"project": project, "updated_at": page[-1]["updated_at"], "id": page[-1]["id"]}
+                    ).encode()
+                ).decode()
+            )
+        return DataResult(data={"conversations": page, "next_cursor": next_cursor})
+
+    @read_command
     def conversation_state(self, caller, project, conversation, cursor=None, limit=50, tail=False):
         from tools.commands import project_path
 
@@ -200,12 +228,43 @@ class ConversationCommands:
         path = conversation_path(project, conversation)
         messages = (self.repo.tail if tail else self.repo.page)(path + "/messages", limit + 1, cursor or "")
         page = list(reversed(messages[:limit])) if tail else messages[:limit]
+        pending = self.repo.query(
+            path + "/messages", filters=[("status", "in", ["queued", "running"])], limit=1
+        )
+        recent_jobs = self.repo.query(
+            project_path(project, "jobs"),
+            filters=[("conversation_id", "==", conversation)],
+            order=[("created_at", True)],
+            limit=15,
+        )
+        active_jobs = self.repo.query(
+            project_path(project, "jobs"),
+            filters=[
+                ("conversation_id", "==", conversation),
+                (
+                    "status",
+                    "in",
+                    [
+                        "queued",
+                        "claimed",
+                        "submitting",
+                        "waiting_for_provider",
+                        "materializing",
+                        "cancel_requested",
+                    ],
+                ),
+            ],
+            order=[("created_at", True)],
+            limit=60,
+        )
+        operations = {j["job_id"]: j for j in [*recent_jobs, *active_jobs]}
         run = (
             self.get_run(caller, project, doc["active_run_id"]).model_dump() if doc["active_run_id"] else None
         )
         return DataResult(
             data={
                 "conversation": doc,
+                "has_pending_message": bool(pending),
                 "production": self.production_summary(caller, project, doc, run),
                 "messages": [{k: v for k, v in m.items() if k not in {"caller", "request"}} for m in page],
                 "run": run,
@@ -218,14 +277,14 @@ class ConversationCommands:
                         "error": j.get("error"),
                         "retried_by": j.get("retried_by"),
                     }
-                    for j in sorted(
-                        self.repo.list_where(
-                            project_path(project, "jobs"), "conversation_id", [conversation]
-                        ),
-                        key=lambda j: j["created_at"],
-                        reverse=True,
-                    )[:15]
+                    for j in operations.values()
                 ],
+                "approvals": self.repo.query(
+                    project_path(project, "approvals"),
+                    filters=[("conversation_id", "==", conversation), ("decision", "==", "pending")],
+                    order=[("created_at", True)],
+                    limit=20,
+                ),
                 "next_cursor": messages[limit - 1]["id"] if len(messages) > limit else None,
             }
         )
@@ -525,89 +584,111 @@ class ConversationScheduler:
         from tools.commands import identifier, project_path
 
         c = self.c
-        for project in c.repo.list("projects"):
-            pid = project.get("project_id")
-            if not pid:
+        candidates = set()
+        for path, _ in c.repo.scan_group(
+            "messages", filters=[("status", "in", ["queued", "running", "needs_reconciliation"])]
+        ):
+            if path.startswith("projects/") and "/conversations/" in path:
+                candidates.add(path.rsplit("/messages/", 1)[0])
+        for path, summary in c.repo.scan_group("run_summaries", filters=[("sync_pending", "==", True)]):
+            if summary.get("conversation_id"):
+                candidates.add(conversation_path(path.split("/")[1], summary["conversation_id"]))
+        for path in sorted(candidates):
+            pid = path.split("/")[1]
+            doc = c.repo.get(path)
+            if not doc:
                 continue
-            for doc in c.repo.list(project_path(pid, "conversations")):
-                path = conversation_path(pid, doc["id"])
-                pending = c.repo.list_where(
-                    path + "/messages", "status", ["queued", "running", "needs_reconciliation"]
+            active = (
+                c.repo.get(project_path(pid, "runs", doc["active_run_id"]))
+                if doc.get("active_run_id")
+                else None
+            )
+            pending = c.repo.query(
+                path + "/messages",
+                filters=[("status", "in", ["queued", "running", "needs_reconciliation"])],
+                limit=1,
+            )
+            if not pending and (
+                not active
+                or (
+                    doc.get("synced_run_id") == active["run_id"]
+                    and doc.get("synced_run_version") == active["version"]
                 )
-                active = (
-                    c.repo.get(project_path(pid, "runs", doc["active_run_id"]))
-                    if doc.get("active_run_id")
-                    else None
-                )
-                needs_sync = active and (
-                    doc.get("synced_run_id") != active["run_id"]
-                    or doc.get("synced_run_version") != active["version"]
-                )
-                if not pending and not needs_sync:
-                    continue
-                owner = identifier("chat_scheduler")
+            ):
+                continue
 
-                def claim(tx, path=path, owner=owner):
+            owner = identifier("chat_scheduler")
+
+            def claim(tx, path=path, owner=owner):
+                latest = tx.get(path)
+                if latest.get("lease_expiry", 0) > c.clock():
+                    return False
+                latest.update(lease_owner=owner, lease_expiry=c.clock() + 30)
+                tx.set(path, latest)
+                return True
+
+            if not c.repo.atomic(claim):
+                continue
+            try:
+                self.advance(pid, c.repo.get(path))
+            except AppError as exc:
+                pending = next(
+                    (
+                        m
+                        for m in c.repo.query(
+                            path + "/messages",
+                            filters=[("status", "in", ["queued", "running", "needs_reconciliation"])],
+                            limit=1,
+                        )
+                    ),
+                    None,
+                )
+                if pending:
+
+                    def record_error(tx, pending=pending, pid=pid, doc=doc, path=path, exc=exc):
+                        tx.set(
+                            path + "/messages/" + pending["id"],
+                            {
+                                **pending,
+                                "status": "cancelled" if exc.payload.code == "ACCESS_DENIED" else "failed",
+                            },
+                        )
+                        append_message(
+                            c,
+                            tx,
+                            pid,
+                            doc["id"],
+                            "error:" + pending["id"],
+                            "assistant",
+                            exc.payload.message,
+                            [{"kind": "error"}],
+                        )
+
+                    c.repo.atomic(record_error)
+            finally:
+
+                def release(tx, path=path, owner=owner):
                     latest = tx.get(path)
-                    if latest.get("lease_expiry", 0) > c.clock():
-                        return False
-                    latest.update(lease_owner=owner, lease_expiry=c.clock() + 30)
-                    tx.set(path, latest)
-                    return True
+                    if latest.get("lease_owner") == owner:
+                        latest["lease_expiry"] = 0
+                        tx.set(path, latest)
 
-                if not c.repo.atomic(claim):
-                    continue
-                try:
-                    self.advance(pid, c.repo.get(path))
-                except AppError as exc:
-                    pending = next(
-                        (
-                            m
-                            for m in c.repo.list(path + "/messages")
-                            if m.get("status") in {"queued", "running", "needs_reconciliation"}
-                        ),
-                        None,
-                    )
-                    if pending:
-
-                        def record_error(tx, pending=pending, pid=pid, doc=doc, path=path, exc=exc):
-                            tx.set(
-                                path + "/messages/" + pending["id"],
-                                {
-                                    **pending,
-                                    "status": "cancelled"
-                                    if exc.payload.code == "ACCESS_DENIED"
-                                    else "failed",
-                                },
-                            )
-                            append_message(
-                                c,
-                                tx,
-                                pid,
-                                doc["id"],
-                                "error:" + pending["id"],
-                                "assistant",
-                                exc.payload.message,
-                                [{"kind": "error"}],
-                            )
-
-                        c.repo.atomic(record_error)
-                finally:
-
-                    def release(tx, path=path, owner=owner):
-                        latest = tx.get(path)
-                        if latest.get("lease_owner") == owner:
-                            latest["lease_expiry"] = 0
-                            tx.set(path, latest)
-
-                    c.repo.atomic(release)
+                c.repo.atomic(release)
 
     def advance(self, project, doc):
         from tools.commands import project_path
 
         c = self.c
         path = conversation_path(project, doc["id"])
-        messages = sorted(c.repo.list(path + "/messages"), key=lambda m: m["sequence"])
+        pending_messages = c.repo.query(
+            path + "/messages",
+            filters=[("status", "in", ["queued", "running", "needs_reconciliation"])],
+            order=[("sequence", False)],
+            limit=1,
+        )
+        messages = list(reversed(c.repo.tail(path + "/messages", 12)))
+        if pending_messages and not any(m["id"] == pending_messages[0]["id"] for m in messages):
+            messages.insert(0, pending_messages[0])
         active = (
             c.repo.get(project_path(project, "runs", doc["active_run_id"])) if doc["active_run_id"] else None
         )
@@ -621,11 +702,14 @@ class ConversationScheduler:
                 if current["active_run_id"] == active["run_id"]:
                     current.update(synced_run_id=active["run_id"], synced_run_version=active["version"])
                     tx.set(path, current)
+                summary_path = project_path(project, "run_summaries", active["run_id"])
+                summary = tx.get(summary_path)
+                if summary and summary.get("version") == active["version"]:
+                    summary["sync_pending"] = False
+                    tx.set(summary_path, summary)
 
             c.repo.atomic(remember)
-        pending = next(
-            (m for m in messages if m.get("status") in {"queued", "running", "needs_reconciliation"}), None
-        )
+        pending = next(iter(pending_messages), None)
         if not pending:
             return
         caller = Caller(**pending["caller"])
@@ -636,7 +720,25 @@ class ConversationScheduler:
                 lambda tx: tx.set(path + "/messages/" + pending["id"], {**pending, "status": "cancelled"})
             )
             return
-        scoped_jobs = c.repo.list_where(project_path(project, "jobs"), "conversation_id", [doc["id"]])
+        scoped_jobs = c.repo.query(
+            project_path(project, "jobs"),
+            filters=[
+                ("conversation_id", "==", doc["id"]),
+                (
+                    "status",
+                    "in",
+                    [
+                        "queued",
+                        "claimed",
+                        "submitting",
+                        "waiting_for_provider",
+                        "materializing",
+                        "cancel_requested",
+                        "submission_unknown",
+                    ],
+                ),
+            ],
+        )
         if any(
             job["job_id"] != pending.get("job_id")
             and (job["status"] not in TERMINAL or job["status"] == "submission_unknown")

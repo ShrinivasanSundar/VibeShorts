@@ -32,9 +32,13 @@ def install(app, commands, caller_dependency):
 
     @app.get("/v1/projects/{project_id}/studio")
     def studio(
-        project_id: str, conversation_id: str | None = None, caller: Caller = Depends(caller_dependency)
+        project_id: str,
+        conversation_id: str | None = None,
+        include_history: bool = True,
+        include_assets: bool = True,
+        caller: Caller = Depends(caller_dependency),
     ):
-        return commands.studio_state(caller, project_id, conversation_id)
+        return commands.studio_state(caller, project_id, conversation_id, include_history, include_assets)
 
     @app.get("/v1/projects/{project_id}/conversations")
     def conversations(
@@ -148,7 +152,7 @@ def install(app, commands, caller_dependency):
 
     @app.get("/v1/projects/{project_id}/compositions/{artifact_id}/preview")
     def preview(project_id: str, artifact_id: str, caller: Caller = Depends(caller_dependency)):
-        commands.get_hyperframe(caller, project_id, artifact_id)
+        commands.inspect_media(caller, project_id, artifact_id)
         data, _ = commands.asset_content(caller, project_id, artifact_id)
         manifest, files = unpack(data)
         document = files["index.html"].decode()

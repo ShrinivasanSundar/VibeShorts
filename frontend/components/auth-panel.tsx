@@ -9,6 +9,7 @@ import { ProjectPanel } from "./project-panel";
 import { ProjectWorkspace } from "./project-workspace";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowUpRight, Film, Layers3, LockKeyhole, Sparkles } from "lucide-react";
+import { clearMediaCache } from "../lib/media-cache";
 import { Brand } from "./brand";
 
 type Project = { project_id: string; name: string };
@@ -32,6 +33,7 @@ export function AuthPanel({ requestId, projectId }: { requestId?: string; projec
   useEffect(() => {
     try {
       return onAuthStateChanged(firebaseAuth(), (next) => {
+        clearMediaCache();
         queryClient.clear();
         setUser(next); setReady(true); setProjects([]); setReview(null); setSelected([]); setError("");
       });

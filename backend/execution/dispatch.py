@@ -23,50 +23,47 @@ class Dispatcher:
 
     def dispatch(self):
         sent = 0
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
-                continue
-            project_id = project["project_id"]
-            for item in self.commands.repo.list_where(
-                project_path(project_id, "outbox"), "status", ["pending"]
-            ):
-                if item["status"] != "pending" or item["next_attempt_at"] > self.commands.clock():
-                    continue
-                try:
-                    self.publisher.publish({"project_id": project_id, "job_id": item["job_id"]})
+        for path, item in self.commands.repo.scan_group(
+            "outbox",
+            filters=[("status", "==", "pending"), ("next_attempt_at", "<=", self.commands.clock())],
+            order=[("next_attempt_at", False), ("__name__", False)],
+        ):
+            project_id = path.split("/")[1]
+            try:
+                self.publisher.publish({"project_id": project_id, "job_id": item["job_id"]})
 
-                    def mark(tx, project_id=project_id, item=item):
-                        path = project_path(project_id, "outbox", item["id"])
-                        current = tx.get(path)
-                        if (
-                            current
-                            and current["status"] == "pending"
-                            and current["next_attempt_at"] == item["next_attempt_at"]
-                        ):
-                            current["status"] = "sent"
-                            tx.set(path, current)
+                def mark(tx, project_id=project_id, item=item):
+                    path = project_path(project_id, "outbox", item["id"])
+                    current = tx.get(path)
+                    if (
+                        current
+                        and current["status"] == "pending"
+                        and current["next_attempt_at"] == item["next_attempt_at"]
+                    ):
+                        current["status"] = "sent"
+                        tx.set(path, current)
 
-                    self.commands.repo.atomic(mark)
-                    sent += 1
-                    event(
-                        "outbox_sent",
-                        job_id=item["job_id"],
-                        queue_age_seconds=self.commands.clock() - item["created_at"],
-                    )
-                except Exception:
+                self.commands.repo.atomic(mark)
+                sent += 1
+                event(
+                    "outbox_sent",
+                    job_id=item["job_id"],
+                    queue_age_seconds=self.commands.clock() - item["created_at"],
+                )
+            except Exception:
 
-                    def retry(tx, project_id=project_id, item=item):
-                        path = project_path(project_id, "outbox", item["id"])
-                        current = tx.get(path)
-                        if current and current["status"] == "pending":
-                            current["attempts"] += 1
-                            current["next_attempt_at"] = self.commands.clock() + min(
-                                60, 2 ** min(current["attempts"], 6)
-                            )
-                            tx.set(path, current)
+                def retry(tx, project_id=project_id, item=item):
+                    path = project_path(project_id, "outbox", item["id"])
+                    current = tx.get(path)
+                    if current and current["status"] == "pending":
+                        current["attempts"] += 1
+                        current["next_attempt_at"] = self.commands.clock() + min(
+                            60, 2 ** min(current["attempts"], 6)
+                        )
+                        tx.set(path, current)
 
-                    self.commands.repo.atomic(retry)
-                    event("outbox_failure", job_id=item["job_id"])
+                self.commands.repo.atomic(retry)
+                event("outbox_failure", job_id=item["job_id"])
         return sent
 
 
@@ -79,98 +76,59 @@ class Reconciler:
 
         WorkflowScheduler(self.commands).sweep()
         recovered = 0
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
-                continue
-            project_id = project["project_id"]
-            for job in self.commands.repo.list_where(
-                project_path(project_id, "jobs"),
-                "status",
-                [
-                    "queued",
-                    "claimed",
-                    "submitting",
-                    "waiting_for_provider",
-                    "cancel_requested",
-                    "submission_unknown",
-                    "materializing",
-                ],
-            ):
-                if job["status"] in {"succeeded", "failed", "cancelled"}:
-                    continue
-                if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
-                    continue
-                candidate = (
-                    self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
-                )
-                from execution.director_recovery import recover_director_failure
-
-                if not candidate and recover_director_failure(self.commands, job):
-                    recovered += 1
-                    continue
-
-                def apply(tx, project_id=project_id, job=job, candidate=candidate):
-                    current = tx.get(project_path(project_id, "jobs", job["job_id"]))
-                    if (
-                        current["status"] in {"succeeded", "failed", "cancelled"}
-                        or current["lease_expires_at"] > self.commands.clock()
-                    ):
-                        return False
-                    current["lease_owner"], current["lease_expires_at"] = None, 0
-                    if current.get("provider_operation") and not candidate:
-                        self.commands.transition(tx, current, "waiting_for_provider")
-                        current["next_poll_at"] = self.commands.clock()
-                        tx.set(project_path(project_id, "jobs", current["job_id"]), current)
-                        tx.set(
-                            project_path(project_id, "outbox", current["job_id"]),
-                            {
-                                "id": current["job_id"],
-                                "job_id": current["job_id"],
-                                "project_id": project_id,
-                                "status": "pending",
-                                "next_attempt_at": self.commands.clock(),
-                                "attempts": 0,
-                                "created_at": self.commands.clock(),
-                            },
-                        )
-                        return True
-                    if current["status"] in {
+        for path, job in self.commands.repo.scan_group(
+            "jobs",
+            filters=[
+                (
+                    "status",
+                    "in",
+                    [
+                        "queued",
+                        "claimed",
                         "submitting",
+                        "waiting_for_provider",
                         "cancel_requested",
                         "submission_unknown",
                         "materializing",
-                    }:
-                        if (
-                            candidate
-                            and candidate[1].get("input_hash") == current["input_hash"]
-                            and candidate[1].get("attempt") == current["attempt"]
-                            and current["candidate_path"] == job["candidate_path"]
-                        ):
-                            self.commands.transition(tx, current, "materializing")
-                        else:
-                            if current["status"] == "submission_unknown":
-                                return False
-                            current["costs"]["uncertain"] = True
-                            entry_path = "budgets/" + project_id + "/entries/" + job["job_id"]
-                            entry = tx.get(entry_path)
-                            entry.update(status="uncertain", uncertain=True)
-                            tx.set(entry_path, entry)
-                            current["error"] = AppError(
-                                "PROVIDER_SUBMISSION_UNCERTAIN",
-                                "The provider may have accepted this request",
-                                action="reconcile",
-                                job_id=job["job_id"],
-                            ).payload.model_dump()
-                            self.commands.transition(tx, current, "submission_unknown")
-                            event("uncertain_submission", job_id=job["job_id"])
-                            return True
-                    else:
-                        self.commands.transition(tx, current, "queued")
+                    ],
+                ),
+                ("lease_expires_at", "<=", self.commands.clock()),
+            ],
+            order=[("lease_expires_at", False), ("__name__", False)],
+        ):
+            project_id = path.split("/")[1]
+            if job["status"] in {"succeeded", "failed", "cancelled"}:
+                continue
+            if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
+                continue
+            if job.get("next_poll_at", 0) > self.commands.clock():
+                continue
+            candidate = self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
+            from execution.director_recovery import recover_director_failure
+
+            if not candidate and recover_director_failure(self.commands, job):
+                recovered += 1
+                continue
+
+            def apply(tx, project_id=project_id, job=job, candidate=candidate):
+                current = tx.get(project_path(project_id, "jobs", job["job_id"]))
+                if (
+                    current["status"] in {"succeeded", "failed", "cancelled"}
+                    or current["lease_expires_at"] > self.commands.clock()
+                    or current.get("next_poll_at", 0) > self.commands.clock()
+                ):
+                    return False
+                current["lease_owner"], current["lease_expires_at"] = None, 0
+                if current.get("provider_operation") and not candidate:
+                    if current["status"] != "waiting_for_provider":
+                        self.commands.transition(tx, current, "waiting_for_provider")
+                    current["next_poll_at"] = self.commands.clock()
+                    tx.set(project_path(project_id, "jobs", current["job_id"]), current)
                     tx.set(
-                        project_path(project_id, "outbox", job["job_id"]),
+                        project_path(project_id, "outbox", current["job_id"]),
                         {
-                            "id": job["job_id"],
-                            "job_id": job["job_id"],
+                            "id": current["job_id"],
+                            "job_id": current["job_id"],
                             "project_id": project_id,
                             "status": "pending",
                             "next_attempt_at": self.commands.clock(),
@@ -178,10 +136,55 @@ class Reconciler:
                             "created_at": self.commands.clock(),
                         },
                     )
-                    event("lease_recovered", job_id=job["job_id"])
                     return True
+                if current["status"] in {
+                    "submitting",
+                    "cancel_requested",
+                    "submission_unknown",
+                    "materializing",
+                }:
+                    if (
+                        candidate
+                        and candidate[1].get("input_hash") == current["input_hash"]
+                        and candidate[1].get("attempt") == current["attempt"]
+                        and current["candidate_path"] == job["candidate_path"]
+                    ):
+                        self.commands.transition(tx, current, "materializing")
+                    else:
+                        if current["status"] == "submission_unknown":
+                            return False
+                        current["costs"]["uncertain"] = True
+                        entry_path = "budgets/" + project_id + "/entries/" + job["job_id"]
+                        entry = tx.get(entry_path)
+                        entry.update(status="uncertain", uncertain=True)
+                        tx.set(entry_path, entry)
+                        current["error"] = AppError(
+                            "PROVIDER_SUBMISSION_UNCERTAIN",
+                            "The provider may have accepted this request",
+                            action="reconcile",
+                            job_id=job["job_id"],
+                        ).payload.model_dump()
+                        self.commands.transition(tx, current, "submission_unknown")
+                        event("uncertain_submission", job_id=job["job_id"])
+                        return True
+                else:
+                    self.commands.transition(tx, current, "queued")
+                tx.set(
+                    project_path(project_id, "outbox", job["job_id"]),
+                    {
+                        "id": job["job_id"],
+                        "job_id": job["job_id"],
+                        "project_id": project_id,
+                        "status": "pending",
+                        "next_attempt_at": self.commands.clock(),
+                        "attempts": 0,
+                        "created_at": self.commands.clock(),
+                    },
+                )
+                event("lease_recovered", job_id=job["job_id"])
+                return True
 
-                recovered += int(self.commands.repo.atomic(apply))
+            recovered += int(self.commands.repo.atomic(apply))
         return recovered
 
 
@@ -256,9 +259,7 @@ class EmulatorPump:
                 time.sleep(60)
                 continue
             time.sleep(
-                self.commands.settings.local_live_poll_seconds
-                if self.commands.settings.local_live
-                else 0.25
+                self.commands.settings.local_live_poll_seconds if self.commands.settings.local_live else 0.25
             )
 
 

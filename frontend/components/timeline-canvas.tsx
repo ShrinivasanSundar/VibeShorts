@@ -3,14 +3,14 @@
 import { useRef } from "react";
 import { Save, X } from "lucide-react";
 import { useWorkspace } from "../lib/workspace";
-import { useStudio } from "../lib/studio-store";
+import { useStudio, useEditor } from "../lib/studio-store";
 import { CompositionPreview } from "./preview";
 import { TimelineEditor, ClipInspector } from "./timeline";
 import { MediaThumbnail } from "./media-thumbnail";
 
 export function TimelineCanvas({ onClose }: { onClose: () => void }) {
   const w = useWorkspace();
-  const s = useStudio();
+  const s = useEditor();
   const pane = useRef<HTMLElement>(null);
   return (
     <aside
@@ -150,8 +150,8 @@ export function TimelineCanvas({ onClose }: { onClose: () => void }) {
               kind: "text" as const,
               artifact_id: null,
               track: 2,
-              start: s.time,
-              duration: Math.min(3, s.timeline.duration_seconds - s.time),
+              start: useStudio.getState().time,
+              duration: Math.min(3, s.timeline.duration_seconds - useStudio.getState().time),
               source_in: 0,
               text: "Your text",
               volume: 0,

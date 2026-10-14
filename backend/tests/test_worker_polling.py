@@ -34,6 +34,7 @@ def test_changed_run_still_synchronizes_without_pending_messages(runtime, alice,
     path = conversation_path(project, chat)
     repo.documents[path].update(active_run_id="run", synced_run_id="run", synced_run_version=1)
     repo.documents[f"projects/{project}/runs/run"] = {"run_id": "run", "version": 2}
+    repo.atomic(lambda tx: runtime.commands.project_run(tx, {"project_id": project, "run_id": "run", "version": 2, "conversation_id": chat, "workflow": {"stage": "production"}}))
     scheduler = ConversationScheduler(runtime.commands)
     advance = Mock()
     monkeypatch.setattr(scheduler, "advance", advance)

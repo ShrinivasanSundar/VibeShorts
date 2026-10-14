@@ -21,31 +21,27 @@ class WorkflowScheduler:
 
     def sweep(self):
         ConversationScheduler(self.commands).sweep()
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
-                continue
-            for run in self.commands.repo.list_where(
-                project_path(project["project_id"], "runs"),
-                "status",
-                ["queued", "running", "waiting_for_jobs"],
-            ):
-                if run.get("workflow") and run["status"] not in {
-                    "cancelled",
-                    "failed",
-                    "succeeded",
-                    "needs_reconciliation",
-                }:
-                    try:
-                        self.advance(project["project_id"], run["run_id"])
-                    except AppError as exc:
-                        if exc.payload.code == "STALE_SCHEDULER":
-                            continue
-                        self.change(
-                            project["project_id"],
-                            run["run_id"],
-                            status="failed",
-                            error=exc.payload.model_dump(),
-                        )
+        for path, run in self.commands.repo.scan_group(
+            "runs", filters=[("status", "in", ["queued", "running", "waiting_for_jobs"])]
+        ):
+            project_id = path.split("/")[1]
+            if run.get("workflow") and run["status"] not in {
+                "cancelled",
+                "failed",
+                "succeeded",
+                "needs_reconciliation",
+            }:
+                try:
+                    self.advance(project_id, run["run_id"])
+                except AppError as exc:
+                    if exc.payload.code == "STALE_SCHEDULER":
+                        continue
+                    self.change(
+                        project_id,
+                        run["run_id"],
+                        status="failed",
+                        error=exc.payload.model_dump(),
+                    )
 
     def change(self, project, run_id, *, owner=None, **values):
         def apply(tx):
@@ -121,6 +117,30 @@ class WorkflowScheduler:
         return self.commands.repo.atomic(apply)
 
     def advance(self, project, run_id):
+        current = self.commands.repo.get(project_path(project, "runs", run_id))
+        if not current or current["status"] in {"cancelled", "failed", "succeeded"}:
+            return
+        conversation = (
+            self.commands.repo.get(conversation_path(project, current["conversation_id"]))
+            if current.get("conversation_id")
+            else None
+        )
+        pending = (
+            self.commands.repo.query(
+                conversation_path(project, current["conversation_id"]) + "/messages",
+                filters=[("status", "in", ["queued", "running"])],
+                limit=1,
+            )
+            if conversation
+            else []
+        )
+        signature = [
+            current["version"],
+            conversation.get("sequence", 0) if conversation else 0,
+            bool(pending),
+        ]
+        if current.get("scheduler_seen") == signature:
+            return
         owner = identifier("scheduler")
 
         def claim(tx):
@@ -147,6 +167,7 @@ class WorkflowScheduler:
                 current = tx.get(path)
                 if current.get("scheduler_owner") == owner:
                     current["scheduler_expiry"] = 0
+                    current["scheduler_seen"] = signature
                     tx.set(path, current)
 
             self.commands.repo.atomic(release)
@@ -168,8 +189,13 @@ class WorkflowScheduler:
             if conversation.get("active_run_id") != run_id:
                 change(project, run_id, status="cancelled")
                 return
-            messages = c.repo.list(conversation_path(project, cid) + "/messages")
-            queued_changes = any(m.get("status") in {"queued", "running"} for m in messages)
+            queued_changes = bool(
+                c.repo.query(
+                    conversation_path(project, cid) + "/messages",
+                    filters=[("status", "in", ["queued", "running"])],
+                    limit=1,
+                )
+            )
             if queued_changes and not (flow.get("mode") == "guided" and flow.get("current_scene_id")):
                 return
 

@@ -16,12 +16,12 @@ import {
 import { AudioWaveform } from "./audio-waveform";
 import { MediaThumbnail } from "./media-thumbnail";
 import { useWorkspace } from "../lib/workspace";
-import { useStudio } from "../lib/studio-store";
+import { useStudio, useEditor } from "../lib/studio-store";
 import type { Clip } from "../lib/studio-types";
 
 export function TimelineEditor() {
   const w = useWorkspace();
-  const s = useStudio();
+  const s = useEditor();
   const ruler = useRef<HTMLDivElement>(null);
   const tracks = Array.from(
     new Set([0, 1, 2, ...s.timeline.clips.map((c) => c.track)]),
@@ -193,12 +193,7 @@ export function TimelineEditor() {
                       <span>{clip.text || clip.id}</span>
                     </button>
                   ))}
-                <div
-                  className="playhead"
-                  style={{
-                    left: `${(s.time / s.timeline.duration_seconds) * 100}%`,
-                  }}
-                />
+                <Playhead />
               </div>
             </div>
           ))}
@@ -216,7 +211,7 @@ export function TimelineEditor() {
 }
 
 export function ClipInspector() {
-  const s = useStudio();
+  const s = useEditor();
   const clip = s.timeline.clips.find((c) => c.id === s.selected);
   function change(delta: Partial<Clip>) {
     if (clip)
@@ -395,4 +390,10 @@ export function ClipInspector() {
       {clip.artifact_id && <small className="mono">{clip.artifact_id}</small>}
     </div>
   );
+}
+
+function Playhead() {
+  const time = useStudio(state => state.time);
+  const duration = useStudio(state => state.timeline.duration_seconds);
+  return <div className="playhead" style={{ left: `${(time / duration) * 100}%` }} />;
 }

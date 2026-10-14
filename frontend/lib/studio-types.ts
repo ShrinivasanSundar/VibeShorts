@@ -168,6 +168,8 @@ export type ChatMessage = {
   job_id?: string;
 };
 export type ConversationState = {
+  approvals?: Approval[];
+  has_pending_message?: boolean;
   production?: ProductionSummary;
   conversation: Conversation;
   messages: ChatMessage[];
