@@ -18,8 +18,9 @@ class ImageOutput:
 
 
 class ProviderFailure(AppError):
-    def __init__(self, code: str, message: str, uncertain=False, retryable=False):
+    def __init__(self, code: str, message: str, uncertain=False, retryable=False, usage=None):
         self.uncertain = uncertain
+        self.usage = usage or {}
         super().__init__(code, message, 503, retryable=retryable)
 
 

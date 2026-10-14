@@ -7,6 +7,7 @@ from tools.commands import identifier, project_path
 from tools.contracts.errors import AppError
 from tools.contracts.models import Artifact, Caller, ImageInput
 from tools.contracts.studio import INPUTS
+from tools.conversations import append_message, head_path
 
 TERMINAL = {"succeeded", "failed", "cancelled", "submission_unknown"}
 
@@ -108,7 +109,9 @@ class ImageWorker:
                     raise AppError("CANCELLED", "Job cancelled", 409)
                 from tools.studio_commands import validate_submission
 
-                validate_submission(self.commands, caller, project_id, kind, request, tx)
+                validate_submission(
+                    self.commands, caller, project_id, kind, request, tx, job.get("conversation_id")
+                )
                 current["attempt"] += 1
                 current["candidate_path"] = (
                     f"projects/{project_id}/jobs/{job_id}/attempt_{current['attempt']}/image"
@@ -246,11 +249,17 @@ class ImageWorker:
                 # Provider safety inference may incur usage even when it returns no image.
                 charge = (
                     current["provider"]["reservation_micros"]
-                    if error.payload.code == "SAFETY_REJECTED" or current.get("provider_operation")
+                    if error.payload.code == "SAFETY_REJECTED"
+                    or current.get("provider_operation")
+                    or getattr(error, "usage", None)
                     else 0
                 )
                 self.commands.settle(
-                    tx, current, charge, "conservative_estimate" if charge else "not_submitted", {}
+                    tx,
+                    current,
+                    charge,
+                    "conservative_estimate" if charge else "not_submitted",
+                    getattr(error, "usage", {}),
                 )
                 current["error"] = error.payload.model_dump()
                 cancelled = current["cancel_requested"] or error.payload.code in {
@@ -258,6 +267,24 @@ class ImageWorker:
                     "CANCELLED",
                 }
                 self.commands.transition(tx, current, "cancelled" if cancelled else "failed")
+            if current.get("conversation_id") and current["kind"] != "director_turn":
+                run = tx.get(project_path(current["project_id"], "runs", current["run_id"]))
+                append_message(
+                    self.commands,
+                    tx,
+                    current["project_id"],
+                    current["conversation_id"],
+                    "job-error:" + current["job_id"] + ":" + current["status"],
+                    "assistant",
+                    current["error"]["message"],
+                    [
+                        {
+                            "kind": "error",
+                            "job_id": current["job_id"],
+                            "retryable": not bool(run and run.get("workflow")),
+                        }
+                    ],
+                )
 
         try:
             self.repo.atomic(apply)
@@ -292,7 +319,7 @@ class ImageWorker:
                 tx, current, metadata["amount_micros"], metadata["cost_basis"], metadata["usage"]
             )
             if kind == "render" and current["input"]["quality"] == "final":
-                project = tx.get(project_path(current["project_id"]))
+                project = tx.get(head_path(current["project_id"], current.get("conversation_id")))
                 if project.get("composition_head") != current["input"]["composition_artifact_id"]:
                     current["cancel_requested"] = True
             if not current["cancel_requested"]:
@@ -322,6 +349,7 @@ class ImageWorker:
                         "prepare": "Prepared media",
                         "frame": "Continuity frame",
                         "storyboard": "Storyboard",
+                        "director_turn": "Director response",
                         "edit": "Edited composition",
                         "composition": current["input"].get("title", "Composition"),
                         "render": "Draft preview"
@@ -336,23 +364,65 @@ class ImageWorker:
                     created_at=self.commands.clock(),
                 ).model_dump()
                 if kind in {"composition", "edit"}:
-                    project = tx.get(project_path(current["project_id"]))
+                    project = tx.get(head_path(current["project_id"], current.get("conversation_id")))
                     if project.get("composition_head") != current["input"].get("expected_head"):
                         raise AppError("REVISION_CONFLICT", "Composition head advanced", 409)
                     old_head = project.get("composition_head")
                     if old_head:
                         old_path = project_path(current["project_id"], "artifact_lifecycle", old_head)
                         old = tx.get(old_path)
-                        old["current"] = False
+                        if old:
+                            old["current"] = False
                         tx.set(old_path, old)
                     project["composition_head"] = artifact_id
-                    tx.set(project_path(current["project_id"]), project)
+                    tx.set(head_path(current["project_id"], current.get("conversation_id")), project)
                 tx.set(project_path(current["project_id"], "artifacts", artifact_id), artifact)
                 tx.set(
                     project_path(current["project_id"], "artifact_lifecycle", artifact_id),
                     {"status": "ready", "object_path": current["candidate_path"], "current": True},
                 )
                 current["artifact_ids"] = [artifact_id]
+                cid = current.get("conversation_id")
+                parent = tx.get(project_path(current["project_id"], "runs", current["run_id"]))
+                if cid and kind in {"composition", "edit"} and not parent.get("workflow"):
+                    approval_id = "approval_" + artifact_id + "_preview"
+                    approval = {
+                        "id": approval_id,
+                        "kind": "preview",
+                        "run_id": None,
+                        "conversation_id": cid,
+                        "target_artifact_id": artifact_id,
+                        "decision": "pending",
+                        "created_at": self.commands.clock(),
+                        "review_url": f"{self.commands.settings.web_url}/projects/{current['project_id']}",
+                    }
+                    tx.set(project_path(current["project_id"], "approvals", approval_id), approval)
+                    append_message(
+                        self.commands,
+                        tx,
+                        current["project_id"],
+                        cid,
+                        "composition:" + artifact_id,
+                        "assistant",
+                        "Your updated video is ready for review.",
+                        [{"kind": "composition", "artifact_id": artifact_id}],
+                    )
+                if (
+                    cid
+                    and kind == "render"
+                    and current["input"]["quality"] == "final"
+                    and not parent.get("workflow")
+                ):
+                    append_message(
+                        self.commands,
+                        tx,
+                        current["project_id"],
+                        cid,
+                        "export:" + artifact_id,
+                        "assistant",
+                        "Your video is ready to download.",
+                        [{"kind": "export", "artifact_id": artifact_id}],
+                    )
             current["lease_owner"], current["lease_expires_at"], current["error"] = None, 0, None
             self.commands.transition(tx, current, "cancelled" if current["cancel_requested"] else "succeeded")
 

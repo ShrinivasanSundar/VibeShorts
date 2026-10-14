@@ -1,6 +1,7 @@
 from tools.composition.package import unpack
 from tools.contracts.errors import AppError
 from tools.contracts.models import GENERATE, DataResult, JobResult
+from tools.conversations import head_path
 
 
 def input_ids(kind, value):
@@ -16,11 +17,13 @@ def input_ids(kind, value):
     return list(dict.fromkeys(ids))
 
 
-def validate_submission(commands, caller, project_id, kind, value, tx=None):
+def validate_submission(commands, caller, project_id, kind, value, tx=None, conversation_id=None):
     from tools.commands import project_path
 
     tx = tx or commands.repo
     commands.authorize(caller, project_id, GENERATE, tx)
+    if conversation_id:
+        commands.conversation(caller, project_id, conversation_id, tx, GENERATE)
     for artifact_id in input_ids(kind, value):
         artifact = commands._artifact(project_id, artifact_id, tx)
         if kind in {"image", "storyboard"} and artifact["type"] != "image":
@@ -50,11 +53,11 @@ def validate_submission(commands, caller, project_id, kind, value, tx=None):
                 if duration and clip.source_in + clip.duration > duration + 0.05:
                     raise AppError("INVALID_INPUT", "Clip exceeds the source duration")
     if kind == "storyboard" and value.revision_of_run_id:
-        project = tx.get(project_path(project_id))
+        project = tx.get(head_path(project_id, conversation_id))
         if project.get("composition_head") != value.expected_head:
             raise AppError("REVISION_CONFLICT", "Composition head advanced", 409)
     if kind in {"composition", "edit"}:
-        project = tx.get(project_path(project_id))
+        project = tx.get(head_path(project_id, conversation_id))
         if project.get("composition_head") != value.expected_head:
             raise AppError("REVISION_CONFLICT", "Composition head advanced", 409)
     if kind == "render":
@@ -62,7 +65,7 @@ def validate_submission(commands, caller, project_id, kind, value, tx=None):
         if artifact["type"] != "composition":
             raise AppError("INVALID_INPUT", "Rendering requires a composition package")
         if value.quality == "final":
-            project = tx.get(project_path(project_id))
+            project = tx.get(head_path(project_id, conversation_id))
             approval = tx.get(
                 project_path(project_id, "approved_compositions", value.composition_artifact_id)
             )
@@ -115,8 +118,12 @@ class StudioCommands:
         self.authorize(caller, project_id)
         return DataResult(data=self._artifact(project_id, artifact_id)["media"])
 
-    def get_hyperframe(self, caller, project_id, artifact_id=None):
-        project = self.authorize(caller, project_id)
+    def get_hyperframe(self, caller, project_id, artifact_id=None, conversation_id=None):
+        project = (
+            self.conversation(caller, project_id, conversation_id)
+            if conversation_id
+            else self.authorize(caller, project_id)
+        )
         artifact_id = artifact_id or project.get("composition_head")
         if not artifact_id:
             return DataResult(data={"artifact_id": None, "manifest": None})
@@ -142,7 +149,7 @@ class StudioCommands:
         data, _ = self.asset_content(caller, project_id, artifact_id)
         return DataResult(data=Storyboard.model_validate_json(data).model_dump())
 
-    def studio_state(self, caller, project_id):
+    def studio_state(self, caller, project_id, conversation_id=None):
         from tools.commands import project_path
 
         project = self.authorize(caller, project_id)
@@ -150,6 +157,27 @@ class StudioCommands:
         runs = self.repo.recent(project_path(project_id, "runs"), 20)
         approvals = self.repo.recent(project_path(project_id, "approvals"), 20)
         approvals_by_id = {a["id"]: a for a in approvals}
+        if conversation_id:
+            conversation = self.conversation(caller, project_id, conversation_id)
+            project = {**project, "composition_head": conversation.get("composition_head")}
+            jobs = sorted(
+                self.repo.list_where(project_path(project_id, "jobs"), "conversation_id", [conversation_id]),
+                key=lambda j: j["created_at"],
+                reverse=True,
+            )[:60]
+            runs = sorted(
+                self.repo.list_where(project_path(project_id, "runs"), "conversation_id", [conversation_id]),
+                key=lambda r: r["created_at"],
+                reverse=True,
+            )[:20]
+            approvals = sorted(
+                self.repo.list_where(
+                    project_path(project_id, "approvals"), "conversation_id", [conversation_id]
+                ),
+                key=lambda a: a["created_at"],
+                reverse=True,
+            )[:20]
+            approvals_by_id = {a["id"]: a for a in approvals}
         return DataResult(
             data={
                 "project": {
@@ -200,10 +228,28 @@ class StudioCommands:
                     if approval.get("run_id")
                     else None
                 )
-                if run and (run["status"] == "cancelled" or run.get("pending_approval_id") != approval_id):
+                if run and (
+                    run["status"] in {"cancelled", "failed"} or run.get("pending_approval_id") != approval_id
+                ):
                     raise AppError("REVISION_CONFLICT", "Approval is no longer current", 409)
+                if run and approval.get("conversation_id"):
+                    conversation = tx.get(head_path(project_id, approval["conversation_id"]))
+                    if conversation.get("active_run_id") != run["run_id"]:
+                        raise AppError("REVISION_CONFLICT", "This video has a newer workflow", 409)
+                if request.approved and approval.get("conversation_id"):
+                    current = tx.get(head_path(project_id, approval["conversation_id"]))
+                    latest = current.get("latest_request_id")
+                    message = (
+                        tx.get(head_path(project_id, approval["conversation_id"]) + "/messages/" + latest)
+                        if latest
+                        else None
+                    )
+                    if message and message.get("status") in {"queued", "running", "needs_reconciliation"}:
+                        raise AppError(
+                            "REVISION_CONFLICT", "Wait for your requested changes before approving", 409
+                        )
                 if approval["kind"] == "preview":
-                    project = tx.get(project_path(project_id))
+                    project = tx.get(head_path(project_id, approval.get("conversation_id")))
                     if project.get("composition_head") != request.target_artifact_id:
                         raise AppError("REVISION_CONFLICT", "Preview revision is stale", 409)
                     tx.set(
@@ -222,7 +268,13 @@ class StudioCommands:
                 tx.set(path, approval)
                 if run:
                     run["pending_approval_id"] = None
-                    run["status"] = "waiting_for_jobs" if request.approved else "failed"
+                    run["status"] = (
+                        "waiting_for_jobs"
+                        if request.approved
+                        else "needs_approval"
+                        if run.get("workflow", {}).get("mode") == "guided"
+                        else "failed"
+                    )
                     run["version"] += 1
                     tx.set(project_path(project_id, "runs", run["run_id"]), run)
                     self.project_run(tx, run)
@@ -240,20 +292,27 @@ class StudioCommands:
 
         return DataResult(data=self.repo.atomic(apply))
 
-    def request_preview_approval(self, caller, project_id, artifact_id, key):
-        from tools.commands import identifier, project_path
+    def request_preview_approval(self, caller, project_id, artifact_id, key, conversation_id=None):
+        from tools.commands import project_path
 
         def apply(tx):
             self.authorize(caller, project_id, GENERATE, tx)
 
             def build():
                 artifact = self._artifact(project_id, artifact_id, tx)
+                current = tx.get(head_path(project_id, conversation_id))
+                if not current or current.get("composition_head") != artifact_id:
+                    raise AppError("REVISION_CONFLICT", "Review the current composition", 409)
                 if artifact["type"] != "composition":
                     raise AppError("INVALID_INPUT", "Composition required")
-                approval_id = identifier("approval")
+                approval_id = "approval_" + artifact_id + "_preview"
+                existing = tx.get(project_path(project_id, "approvals", approval_id))
+                if existing:
+                    return existing
                 approval = {
                     "id": approval_id,
                     "kind": "preview",
+                    "conversation_id": conversation_id,
                     "run_id": None,
                     "target_artifact_id": artifact_id,
                     "decision": "pending",
@@ -268,7 +327,7 @@ class StudioCommands:
                 project_path(project_id),
                 "preview.request",
                 key,
-                {"artifact_id": artifact_id},
+                {"artifact_id": artifact_id, "conversation_id": conversation_id},
                 build,
                 caller.uid,
             )

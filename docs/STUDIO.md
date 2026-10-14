@@ -39,15 +39,53 @@ switch frontend values deliberately if returning from a live setup.
 
 In another terminal, run `bash scripts/dev.sh`. This starts API/MCP on port 8000, the queue worker and Studio on port 3000. It creates missing local env files without replacing existing files. Open **http://127.0.0.1:3000**. Google sign-in uses the Firebase Auth emulator in this configuration. Keep all emulator services running while using Studio.
 
-After signing in, create a project. Enter a brief in the Director panel and generate a short. Review the storyboard before production starts. Follow progress in Activity; review the completed preview before approving final export. Download the private MP4 and editable ZIP in Exports.
+After signing in, create a project. All videos use one workspace:
 
-Assets supports verified image, audio, MP4 and font imports. Image uploads have a 7 MB limit, fonts 2 MB and audio/video 200 MB, with a maximum supported media duration of 125 seconds. Brand settings persist immutable revisions with exact logo/font references, colors, image references and policy text.
+1. Describe an idea in **What’s your story?**. Optionally select Vibe, Motion, Format,
+   or open More options for duration, language, policy, and a request allowance.
+2. Review or revise the storyboard beside the agent. **Approve and create video**
+   authorizes production against the project allowance. New videos run through
+   scenes and music to the combined preview without individual Continue buttons.
+3. Review the preview. **Edit** opens the scenes list, clip properties, and timeline;
+   the agent can collapse without losing edits. Back to preview preserves local edits.
+4. **Approve and export** approves the exact composition. Saving edits creates a new
+   revision requiring new approval. Downloads stay in the same conversation.
 
-The timeline supports positioning, trim points, duration, track placement, exact copy, volume/fades, visibility, deletion, zoom, seeking and undo/redo. Save creates a new immutable package using the expected current head. A competing save conflicts. Final export requires approval of the exact current package. Pending local edits must be saved first.
+The compact navigation rail opens Projects, Style, Library, and Settings drawers.
+Library contains uploads, standalone image/music creation, and **Start a blank video**
+for manual assembly. Editing retains composition duration, clip layers, timing, sound,
+caption controls, and undo/redo. Settings retains Brand,
+Team, production details, exports, and project allowance information. Projects offers
+**Create multiple videos**, with a separate conversation and approval for each brief.
+Switching videos or returning to projects with unsaved edits offers Save, Discard, or Cancel.
 
-Fixture natural-language edits support quoted copy replacement, title, mute, aspect ratio, colors and shortening. General timeline edits invoke the configured ADK director. To revise a generated scene, enter `scene scene-1: your new visual prompt` on the current completed short. The new run reuses unaffected music and scenes, rebuilds continuity-dependent scenes, and requires both review gates again. Fixture outputs are synthetic test media; they demonstrate orchestration rather than creative generation quality.
+Style/motion selections are prompt preferences, not visual filters. Changing existing
+scenes proposes a revised storyboard and explains which scenes need regeneration.
+Generation waits for approval; copy-only changes reuse media. Job states come from
+actual operations. The interface does not invent progress percentages.
+
+Older chat links remain valid; the obsolete `mode` parameter and stored mode preference
+are ignored. Existing guided runs retain their scene checkpoints. Explicitly opening
+an older production or a standalone composition links it to a conversation without
+changing its artifacts or project head. New replacement runs from the unified composer
+use bulk production. Unscoped API clients keep their existing behavior.
 
 ## Repeatable acceptance
+
+Browser fixture checks use an isolated Auth emulator, an in-memory API/worker, and actual
+synthetic image/video media. They exercise the UI and coordinator with a lightweight draft/export
+stand-in; the full renderer is checked by the export acceptance command below. Install Chromium
+once, then run:
+
+```sh
+npx playwright install chromium
+npm run test:browser --workspace frontend
+```
+
+The browser suite starts its own services on ports 19099 (Auth), 8100 (API), and 3100 (web),
+and stops them when it finishes. It does not call paid providers. Playwright traces and screenshots
+are saved under `.cache/browser-results`. Backend conversation checks run with
+`uv run --directory backend pytest tests/test_conversations.py`.
 
 In a fresh fixture-configured terminal, with emulators running and no separate worker
 consuming their queue (do not leave `scripts/dev.sh` running during this smoke test):
@@ -130,6 +168,8 @@ storyboard → preview → export review flow described above.
 
 ### Provider routes and operation budgets
 
+Local live workers poll every 30 seconds by default; set `VIBESHORTS_LOCAL_LIVE_POLL_SECONDS` (5–300) to adjust the interval. Idle chats do not acquire scheduler leases, and reconciliation replaces the workflow sweep for that cycle. Quota logs include the failed operation and underlying provider error. A Firestore `429 Quota exceeded` requires checking the Firebase project's database usage and billing; changing the application's media allowance does not restore database quota.
+
 Explicit routes:
 
 - `VIBESHORTS_PROVIDER=vertex`: server ADC, real cloud project, model-specific locations and positive reviewed allowances.
@@ -168,8 +208,8 @@ Local Docker rendering uses `VIBESHORTS_RENDER_RUNNER=docker` and `VIBESHORTS_RE
 
 ## Scope and remaining validation
 
-Implemented: image/video/music jobs, media preparation/frame extraction, typed storyboards, two review gates, immutable HyperFrames packages, rendering/export, Studio timeline, revisions, dependency traversal, project members, three director policies, locale requests, batch brief submission and deterministic brand checks.
+Implemented: image/video/music jobs, media preparation/frame extraction, typed storyboards, durable video conversations with isolated revision heads, guided scene review, a unified agent/preview/edit workspace, immutable HyperFrames packages, rendering/export, Studio timeline, revisions, dependency traversal, project members, three director policies, locale requests, batch brief submission and deterministic brand checks.
 
 The application schedules job dependencies and approvals durably rather than asking a resident director to wait. Neural brand assessment, organization-level shared asset libraries and a template catalog remain extensions to the README roadmap. Locale handling in live plans depends on the director; bundled Inter covers Latin text, so upload an appropriate brand font for other scripts.
 
-Verified locally: unit/transport tests, OAuth/stdio/Inspector image workflows, default-deny rules, ADK session persistence tests, frontend production compilation, and actual fixture video export. Live ADK/Vertex/Developer calls, container builds, production storage signing/IAM and deployed render isolation require credentials and target infrastructure. Browser UI interaction was unavailable in this tool session; frontend interaction still needs your browser test.
+Verified locally: unit/transport tests, OAuth/stdio/Inspector image workflows, default-deny rules, ADK session persistence tests, frontend production compilation, actual fixture video export, and Playwright desktop/mobile flows covering automatic production, legacy scene review, optional timeline edits, agent collapse, save/reapproval, download and reload. Live ADK/Vertex/Developer calls, container builds, production storage signing/IAM and deployed render isolation require credentials and target infrastructure.

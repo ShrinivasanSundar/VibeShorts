@@ -61,6 +61,10 @@ class MemoryRepository:
     def recent(self, collection: str, limit: int) -> list[Doc]:
         return sorted(self.list(collection), key=lambda d: d.get("created_at", 0), reverse=True)[:limit]
 
+    def tail(self, collection: str, limit: int, before: str = "") -> list[Doc]:
+        docs = [d for d in self.list(collection) if not before or d["id"] < before]
+        return sorted(docs, key=lambda d: d["id"], reverse=True)[:limit]
+
     def list_where(self, collection: str, field: str, values: list) -> list[Doc]:
         return [d for d in self.list(collection) if d.get(field) in values]
 
@@ -79,6 +83,17 @@ class FirestoreRepository:
 
     def recent(self, collection: str, limit: int) -> list[Doc]:
         query = self.client.collection(collection).order_by("created_at", direction="DESCENDING").limit(limit)
+        return [s.to_dict() for s in query.stream()]
+
+    def tail(self, collection: str, limit: int, before: str = "") -> list[Doc]:
+        # Conversation messages have monotonic sequences. Firestore rejects a
+        # descending scan ordered solely by the document key.
+        query = self.client.collection(collection).order_by("sequence", direction="DESCENDING").limit(limit)
+        if before:
+            cursor = self.client.document(collection + "/" + before).get()
+            if not cursor.exists:
+                return []
+            query = query.start_after(cursor)
         return [s.to_dict() for s in query.stream()]
 
     def list_where(self, collection: str, field: str, values: list) -> list[Doc]:

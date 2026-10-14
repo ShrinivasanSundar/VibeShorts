@@ -22,6 +22,7 @@ from tools.contracts.models import (
     JobResult,
     RunResult,
 )
+from tools.conversations import ConversationCommands, conversation_path
 from tools.studio_commands import StudioCommands
 
 
@@ -50,7 +51,7 @@ def project_path(project_id, collection=None, record_id=None):
     return path
 
 
-class Commands(StudioCommands):
+class Commands(StudioCommands, ConversationCommands):
     def __init__(self, repo, storage, identity, provider, settings, clock=time.time):
         self.repo, self.storage, self.identity = repo, storage, identity
         self.provider, self.settings, self.clock = provider, settings, clock
@@ -273,7 +274,9 @@ class Commands(StudioCommands):
     def generate_image(self, caller, request: ImageCommand):
         return self.submit_job(caller, request, "image")
 
-    def submit_job(self, caller, request, kind, parent_run=None):
+    def submit_job(
+        self, caller, request, kind, parent_run=None, storyboard_override=None, reused_children=None
+    ):
         def replay(tx):
             self.authorize(caller, request.project_id, GENERATE, tx)
             previous = tx.get(
@@ -296,7 +299,9 @@ class Commands(StudioCommands):
             return JobHandle(**existing)
         provider = self.provider_for(kind)
         snapshot = provider.snapshot(request.input) if kind == "video" else provider.snapshot()
-        revision_plan, reused = None, {}
+        if storyboard_override is not None:
+            snapshot = {**snapshot, "route": "local", "model": "typed-storyboard-v1", "reservation_micros": 0}
+        revision_plan, reused = storyboard_override, reused_children or {}
         if kind == "storyboard" and request.input.revision_of_run_id:
             base_run = self.get_run(caller, request.project_id, request.input.revision_of_run_id)
             flow = base_run.workflow
@@ -340,10 +345,16 @@ class Commands(StudioCommands):
                         raise AppError("INVALID_INPUT", "Reference image exceeds provider input limit")
                 from tools.studio_commands import validate_submission
 
-                validate_submission(self, caller, request.project_id, kind, request.input, tx)
+                validate_submission(
+                    self, caller, request.project_id, kind, request.input, tx, request.conversation_id
+                )
                 parent = tx.get(project_path(request.project_id, "runs", parent_run)) if parent_run else None
                 if parent_run and (not parent or parent["status"] in {"cancelled", "failed", "succeeded"}):
                     raise AppError("CANCELLED", "Parent run no longer accepts work", 409)
+                if request.conversation_id:
+                    self.conversation(caller, request.project_id, request.conversation_id, tx, GENERATE)
+                if parent and parent.get("conversation_id") != request.conversation_id:
+                    raise AppError("INVALID_INPUT", "Child job scope does not match its workflow")
                 budget_path = "budgets/" + request.project_id
                 budget = tx.get(budget_path)
                 estimate = snapshot["reservation_micros"]
@@ -385,6 +396,7 @@ class Commands(StudioCommands):
                 job = {
                     **handle,
                     "project_id": request.project_id,
+                    "conversation_id": request.conversation_id,
                     "kind": kind,
                     "input_artifacts": __import__("tools.studio_commands", fromlist=["input_ids"]).input_ids(
                         kind, request.input
@@ -424,6 +436,7 @@ class Commands(StudioCommands):
                     run = {
                         "run_id": run_id,
                         "project_id": request.project_id,
+                        "conversation_id": request.conversation_id,
                         "status": "queued",
                         "version": 1,
                         "brand_version": brand_version,
@@ -439,6 +452,7 @@ class Commands(StudioCommands):
                     if kind == "storyboard":
                         run["workflow"] = {
                             "stage": "storyboard",
+                            "mode": request.input.workflow_mode,
                             "brief": request.input.model_dump(),
                             "storyboard_job": job_id,
                             "children": reused,
@@ -446,6 +460,33 @@ class Commands(StudioCommands):
                         }
                     tx.set(project_path(request.project_id, "runs", run_id), run)
                     self.project_run(tx, run)
+                    if kind == "storyboard" and request.conversation_id:
+                        cpath = conversation_path(request.project_id, request.conversation_id)
+                        conversation = tx.get(cpath)
+                        previous_run_id = conversation.get("active_run_id")
+                        if previous_run_id and previous_run_id != run_id:
+                            previous_path = project_path(request.project_id, "runs", previous_run_id)
+                            previous_run = tx.get(previous_path)
+                            if previous_run and previous_run["status"] not in {
+                                "succeeded",
+                                "failed",
+                                "cancelled",
+                            }:
+                                pending_id = previous_run.get("pending_approval_id")
+                                if pending_id:
+                                    approval_path = project_path(request.project_id, "approvals", pending_id)
+                                    approval = tx.get(approval_path)
+                                    if approval and approval["decision"] == "pending":
+                                        tx.set(approval_path, {**approval, "decision": "superseded"})
+                                previous_run.update(
+                                    status="cancelled",
+                                    pending_approval_id=None,
+                                    version=previous_run["version"] + 1,
+                                )
+                                tx.set(previous_path, previous_run)
+                                self.project_run(tx, previous_run)
+                        conversation["active_run_id"] = run_id
+                        tx.set(cpath, conversation)
                 tx.set(
                     project_path(request.project_id, "steps", step_id),
                     {
@@ -732,6 +773,7 @@ class Commands(StudioCommands):
                 artifact["id"] > after
                 and lifecycle
                 and lifecycle["status"] == "ready"
+                and artifact["type"] != "director_turn"
                 and (type is None or artifact["type"] == type)
             ):
                 ready.append({k: v for k, v in artifact.items() if k != "storage_uri"})

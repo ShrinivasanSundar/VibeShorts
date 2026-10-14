@@ -6,7 +6,8 @@
     "dev": "next dev --hostname 127.0.0.1 --webpack",
     "build": "next build --webpack",
     "start": "next start --hostname 0.0.0.0",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@hyperframes/player": "0.8.116",
@@ -23,6 +24,7 @@
     "zustand": "5.0.15"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.0",
     "@tailwindcss/postcss": "4.3.3",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

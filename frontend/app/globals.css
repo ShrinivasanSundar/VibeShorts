@@ -1,4 +1,6 @@
 @import "tailwindcss";
+@import "./chat.css";
+@import "./unified.css";
 
 /* Design tokens from the VibeShortsAI landing page. */
 

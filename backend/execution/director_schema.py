@@ -2,7 +2,7 @@
 
 from pydantic import Field
 
-from tools.contracts.studio import Clip, Composition, MusicInput, Scene, Storyboard
+from tools.contracts.studio import Clip, Composition, DirectorTurn, MusicInput, Scene, Storyboard
 
 
 class DirectorMusic(MusicInput):
@@ -28,3 +28,7 @@ class DirectorComposition(Composition):
     schema_version: int = Field(default=1, ge=1, le=1)
     fps: int = Field(default=24, ge=24, le=24)
     clips: list[DirectorClip] = Field(default_factory=list, max_length=80)
+
+
+class DirectorConversation(DirectorTurn):
+    storyboard: DirectorStoryboard | None = None

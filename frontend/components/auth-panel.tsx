@@ -6,7 +6,7 @@ import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 import { firebaseAuth, signInWithGoogle } from "../lib/firebase";
 import { call } from "../lib/api";
 import { ProjectPanel } from "./project-panel";
-import { Studio } from "./studio";
+import { ProjectWorkspace } from "./project-workspace";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowUpRight, Film, Layers3, LockKeyhole, Sparkles } from "lucide-react";
 import { Brand } from "./brand";
@@ -73,7 +73,7 @@ export function AuthPanel({ requestId, projectId }: { requestId?: string; projec
     window.location.assign(result.redirect_url);
   }
 
-  if(projectId && user && !requestId) return <Studio key={`${user.uid}:${projectId}`} projectId={projectId} user={user}/>;
+  if(projectId && user && !requestId) return <ProjectWorkspace key={`${user.uid}:${projectId}`} projectId={projectId} user={user}/>;
 
   return <main className={`shell ${requestId ? "connection-shell" : "workspace-shell"}`}>
     <header className="workspace-header"><Link href="/" aria-label="VibeShortsAI home"><Brand /></Link><span className="stage"><span className="dot" /> CREATIVE STUDIO</span></header>

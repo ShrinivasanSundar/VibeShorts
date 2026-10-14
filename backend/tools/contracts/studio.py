@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -61,7 +61,13 @@ class Scene(Contract):
     continuity_from_scene_id: str | None = None
 
 
+class CreativePreferences(Contract):
+    vibe: Literal["cinematic", "cartoon", "collage", "3d"] | None = None
+    motion: Literal["real_time", "slow_motion"] = "real_time"
+
+
 class Storyboard(Contract):
+    creative_preferences: CreativePreferences | None = None
     schema_version: Literal[1] = 1
     project_id: str
     brand_version: str | None = None
@@ -98,6 +104,7 @@ class BriefInput(Contract):
     revision_of_run_id: str | None = None
     expected_head: str | None = None
     scene_overrides: dict[str, str] = Field(default_factory=dict, max_length=5)
+    workflow_mode: Literal["bulk", "guided"] = "bulk"
 
     @model_validator(mode="after")
     def revision(self):
@@ -169,8 +176,69 @@ class EditInput(Contract):
     spend_cap_micros: int | None = Field(default=None, ge=0)
 
 
+class ConversationInput(Contract):
+    instruction: str = Field(min_length=1, max_length=6000)
+    context: dict[str, Any] = Field(default_factory=dict)
+    reference_artifact_ids: list[str] = Field(default_factory=list, max_length=3)
+    spend_cap_micros: int | None = Field(default=None, ge=0)
+
+
+class DirectorTurn(Contract):
+    text: str = Field(min_length=1, max_length=4000)
+    action: Literal["clarify", "storyboard", "generate_scene", "edit_composition", "status"]
+    storyboard: Storyboard | None = None
+    scene_id: str | None = None
+    instruction: str | None = Field(default=None, max_length=2000)
+    storyboard_only: bool = False
+
+    @model_validator(mode="after")
+    def action_payload(self):
+        if self.action == "storyboard" and self.storyboard is None:
+            raise ValueError("A storyboard action requires a complete typed storyboard")
+        if self.action == "generate_scene" and not self.scene_id:
+            raise ValueError("A scene action requires an existing scene id")
+        if self.action == "edit_composition" and not self.instruction:
+            raise ValueError("An edit action requires an instruction")
+        return self
+
+
+class ConversationCreate(Mutation):
+    composition_artifact_id: str | None = None
+
+    @model_validator(mode="after")
+    def source(self):
+        if self.run_id and self.composition_artifact_id:
+            raise ValueError("Choose a workflow or a composition, not both")
+        return self
+
+    title: str = Field(default="New video", min_length=1, max_length=120)
+    run_id: str | None = None
+    workflow_mode: Literal["bulk", "guided"] = "guided"
+
+
+class ConversationMessage(Mutation):
+    workflow_mode: Literal["bulk", "guided"] | None = None
+    creative_preferences: CreativePreferences | None = None
+    policy: Literal["product_launch", "explainer", "social_ad"] = "product_launch"
+    text: str = Field(min_length=1, max_length=6000)
+    duration_seconds: float = Field(default=15, ge=6, le=30)
+    aspect_ratio: Literal["9:16", "16:9"] = "9:16"
+    locale: str = Field(default="en", max_length=20)
+    reference_artifact_ids: list[str] = Field(default_factory=list, max_length=3)
+    spend_cap_micros: int | None = Field(default=None, ge=0)
+
+
+class ConversationAction(Mutation):
+    action: Literal["approve", "continue", "revise", "retry", "cancel"]
+    job_id: str | None = None
+    approval_id: str | None = None
+    target_artifact_id: str | None = None
+    instruction: str | None = Field(default=None, min_length=1, max_length=2000)
+
+
 class StudioCommand(Mutation):
     project_id: str
+    conversation_id: str | None = None
     input: (
         VideoInput
         | MusicInput
@@ -180,6 +248,7 @@ class StudioCommand(Mutation):
         | Composition
         | RenderInput
         | EditInput
+        | ConversationInput
     )
 
 
@@ -207,4 +276,5 @@ INPUTS = {
     "composition": Composition,
     "render": RenderInput,
     "edit": EditInput,
+    "director_turn": ConversationInput,
 }

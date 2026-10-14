@@ -40,6 +40,73 @@ def real_user(runtime):
     return token, runtime.commands.identity.verify(token)
 
 
+def test_conversation_scene_checkpoint_and_heads_survive_runtime_restart():
+    from execution.workflow import WorkflowScheduler
+    from tools.contracts.studio import ApprovalDecision, ConversationCreate, ConversationMessage
+
+    runtime = Runtime.create()
+    _, caller = real_user(runtime)
+    project = runtime.commands.create_project(
+        caller, ProjectCreate(name="Persistent video chats", idempotency_key="persistent-project")
+    ).data["project_id"]
+    first = runtime.commands.create_conversation(
+        caller, project, ConversationCreate(idempotency_key="first")
+    ).data["id"]
+    second = runtime.commands.create_conversation(
+        caller, project, ConversationCreate(idempotency_key="second")
+    ).data["id"]
+    for conversation in (first, second):
+        runtime.commands.send_message(
+            caller,
+            project,
+            conversation,
+            ConversationMessage(
+                idempotency_key="idea", text="Just write a 6 second robot storyboard", duration_seconds=6
+            ),
+        )
+
+    def tick():
+        restarted = Runtime.create()
+        WorkflowScheduler(restarted.commands).sweep()
+        for job in restarted.commands.repo.list(project_path(project, "jobs")):
+            if job["status"] == "queued":
+                restarted.worker.execute(project, job["job_id"])
+
+    for _ in range(5):
+        tick()
+    restarted = Runtime.create()
+    a = restarted.commands.conversation_state(caller, project, first, tail=True).data
+    b = restarted.commands.conversation_state(caller, project, second, tail=True).data
+    assert a["conversation"]["storyboard_head"] != b["conversation"]["storyboard_head"]
+    assert a["run"]["approval"]["kind"] == "storyboard"
+    approval = a["run"]["approval"]
+    restarted.commands.decide_approval(
+        caller,
+        project,
+        approval["id"],
+        ApprovalDecision(
+            idempotency_key="first-plan", target_artifact_id=approval["target_artifact_id"], approved=True
+        ),
+    )
+    for _ in range(12):
+        tick()
+    recovered = Runtime.create().commands.conversation_state(caller, project, first, tail=True).data
+    assert recovered["run"]["approval"]["kind"] == "scene"
+    assert recovered["run"]["approval"]["scene_id"] == "scene-1"
+    assert "scene-2:keyframe" not in recovered["run"]["workflow"]["children"]
+    assert any(block["kind"] == "scene" for m in recovered["messages"] for block in m["blocks"])
+    latest = Runtime.create().commands.conversation_state(caller, project, first, tail=True, limit=1).data
+    older = (
+        Runtime.create()
+        .commands.conversation_state(caller, project, first, tail=True, limit=1, cursor=latest["next_cursor"])
+        .data
+    )
+    assert older["messages"][0]["sequence"] < latest["messages"][0]["sequence"]
+    unchanged = Runtime.create().commands.conversation_state(caller, project, second).data
+    assert unchanged["conversation"]["storyboard_head"] == b["conversation"]["storyboard_head"]
+    assert unchanged["run"]["approval"]["kind"] == "storyboard"
+
+
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
 async def test_real_firestore_pubsub_storage_oauth_and_restart(mode, monkeypatch):
     from test_oauth import authorization

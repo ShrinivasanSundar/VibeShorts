@@ -14,6 +14,7 @@ const csp = [
 ].join("; ");
 
 const config: NextConfig = {
+  distDir: process.env.VIBESHORTS_BROWSER_FIXTURE === "true" ? ".next-fixture" : ".next",
   poweredByHeader: false,
   output: "standalone",
   async headers() {

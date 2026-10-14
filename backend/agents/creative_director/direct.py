@@ -16,11 +16,11 @@ from google.adk.runners import Runner
 from google.genai import types
 
 from execution.director_environment import prepare_environment
-from execution.director_schema import DirectorComposition, DirectorStoryboard
+from execution.director_schema import DirectorComposition, DirectorConversation, DirectorStoryboard
 from execution.paths import BACKEND_ROOT
 from sessions.firestore.bridge import JobResultBridge
 from sessions.firestore.service import FirestoreSessionService
-from tools.contracts.studio import Composition, Storyboard
+from tools.contracts.studio import Composition, DirectorTurn, Storyboard
 
 
 async def main():
@@ -54,19 +54,52 @@ async def main():
         )
 
     editing = payload.get("operation") == "edit"
-    schema = Composition if editing else Storyboard
+    chatting = payload.get("operation") == "director_turn"
+    if chatting:
+        # Empty brand results can cause repeated tool calls. Bind this trusted
+        # context once and use the model's native structured-response schema.
+        payload["brand_dna"] = get_brand_dna() or {}
+    schema = DirectorTurn if chatting else Composition if editing else Storyboard
     director = LlmAgent(
         name="creative_director",
         model=Gemini(model=payload["model"], retry_options=types.HttpRetryOptions(attempts=1)),
         instruction=(
-            "Edit only the provided typed timeline according to the instruction. Preserve artifact ids and "
+            "You are a friendly video director in a beginner chat. Return a DirectorTurn "
+            "with concise, plain-language text. "
+            "Use context.history, context.storyboard, context.composition, and context.settings in request. "
+            "Brand settings are supplied in brand_dna; an empty object means no brand is configured. "
+            "Choose status for questions; clarify when the target or request is ambiguous. "
+            "For ideas or storyboard and scene revisions, return action storyboard and the "
+            "complete revised Storyboard. Style or motion changes require a storyboard action, "
+            "never an instant composition filter. "
+            "Respect settings.creative_preferences and policy. Explain which scenes need regeneration; "
+            "human approval is required. "
+            "Preserve unchanged scene ids, prompts and references. For copy-only edits "
+            "preserve visual prompts exactly. "
+            "Use 3 to 5 scenes totalling 6 to 30 seconds, each at most 8 seconds, 24 fps, "
+            "instrumental music, and supported aspect ratios. "
+            "Use the supplied project_id and brand_version. Default to settings. For "
+            "storyboard-only requests set storyboard_only. "
+            "Use generate_scene with an existing scene id for production requests; approval"
+            " is performed by the human through cards. "
+            "Use edit_composition and instruction for timeline, sound, or duration edits "
+            "after a composition exists. "
+            "Never approve, export, invent artifact ids, or call providers. All execution "
+            "goes through application commands."
+            if chatting
+            else "Edit only the provided typed timeline according to the instruction. "
+            "Preserve artifact ids and "
             "Preserve clip settings. Return a valid Composition. Never approve it or replace original media."
             if editing
             else (BACKEND_ROOT / "skills/product_launch/director.md").read_text()
         ),
-        output_schema=DirectorComposition if editing else DirectorStoryboard,
+        output_schema=DirectorConversation
+        if chatting
+        else DirectorComposition
+        if editing
+        else DirectorStoryboard,
         output_key="storyboard",
-        tools=[get_brand_dna],
+        tools=[] if chatting else [get_brand_dna],
         generate_content_config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=4096),
     )
     app = App(
@@ -97,9 +130,22 @@ async def main():
         if event.is_final_response() and event.content:
             text = "".join(part.text or "" for part in event.content.parts)
             storyboard = schema.model_validate_json(text)
-            if not editing and (
-                storyboard.project_id != payload["project_id"]
-                or storyboard.brand_version != payload["brand_version"]
+            if (
+                chatting
+                and storyboard.storyboard
+                and (
+                    storyboard.storyboard.project_id != payload["project_id"]
+                    or storyboard.storyboard.brand_version != payload["brand_version"]
+                )
+            ):
+                raise ValueError("Director changed trusted context")
+            if (
+                not editing
+                and not chatting
+                and (
+                    storyboard.project_id != payload["project_id"]
+                    or storyboard.brand_version != payload["brand_version"]
+                )
             ):
                 raise ValueError("Director changed trusted context")
             print(storyboard.model_dump_json())
@@ -109,4 +155,5 @@ async def main():
     raise RuntimeError("Director produced no typed plan")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

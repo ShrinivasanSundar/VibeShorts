@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VIBESHORTS_", extra="ignore")
     mode: Literal["emulator", "production"] = "emulator"
     local_live: bool = False
+    local_live_poll_seconds: int = Field(default=30, ge=5, le=300)
     google_cloud_project: str = Field(default="demo-vibeshorts", validation_alias="GOOGLE_CLOUD_PROJECT")
     vertex_project: str | None = Field(default=None, min_length=1)
     vertex_credentials: str | None = Field(default=None, min_length=1)

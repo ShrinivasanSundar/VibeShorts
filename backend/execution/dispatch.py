@@ -103,6 +103,11 @@ class Reconciler:
                 candidate = (
                     self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
                 )
+                from execution.director_recovery import recover_director_failure
+
+                if not candidate and recover_director_failure(self.commands, job):
+                    recovered += 1
+                    continue
 
                 def apply(tx, project_id=project_id, job=job, candidate=candidate):
                     current = tx.get(project_path(project_id, "jobs", job["job_id"]))
@@ -210,10 +215,11 @@ class EmulatorPump:
         except AlreadyExists:
             pass
 
-    def once(self):
+    def once(self, *, sweep_workflows=True):
         from execution.workflow import WorkflowScheduler
 
-        WorkflowScheduler(self.commands).sweep()
+        if sweep_workflows:
+            WorkflowScheduler(self.commands).sweep()
         from google.api_core.exceptions import DeadlineExceeded
 
         self.dispatcher.dispatch()
@@ -237,15 +243,23 @@ class EmulatorPump:
             from google.api_core.exceptions import ResourceExhausted
 
             try:
+                reconciled = False
+                operation = "reconcile"
                 if time.time() >= next_sweep:
                     self.reconciler.sweep()
                     next_sweep = time.time() + 60
-                self.once()
-            except ResourceExhausted:
-                event("worker_quota_exhausted", retry_after_seconds=60)
+                    reconciled = True
+                operation = "dispatch_and_execute"
+                self.once(sweep_workflows=not reconciled)
+            except ResourceExhausted as exc:
+                event("worker_quota_exhausted", operation=operation, error=str(exc), retry_after_seconds=60)
                 time.sleep(60)
                 continue
-            time.sleep(5 if self.commands.settings.local_live else 0.25)
+            time.sleep(
+                self.commands.settings.local_live_poll_seconds
+                if self.commands.settings.local_live
+                else 0.25
+            )
 
 
 def reconcile_decision(commands, project_id, job_id, amount_micros, evidence, operator):

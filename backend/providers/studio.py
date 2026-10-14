@@ -17,7 +17,7 @@ from providers.image import ImageOutput, ProviderFailure
 from tools.composition.package import build, unpack
 from tools.contracts.errors import AppError
 from tools.contracts.models import Caller
-from tools.contracts.studio import Composition, MusicInput, Scene, Storyboard
+from tools.contracts.studio import Composition, DirectorTurn, MusicInput, Scene, Storyboard
 from tools.media.pipeline import extract, inspect, prepare, run
 
 LOCAL = {"prepare", "frame", "composition", "render"}
@@ -40,6 +40,7 @@ class StudioProvider:
             "music": s.music_model if route != "developer" else s.developer_music_model,
             "storyboard": s.director_model,
             "edit": s.director_model,
+            "director_turn": s.director_model,
         }
         reservation = 0
         if route in {"vertex", "developer", "cloud_run"}:
@@ -52,6 +53,7 @@ class StudioProvider:
                 "music": "music_per_call_micros",
                 "storyboard": "director_reservation_micros",
                 "edit": "director_reservation_micros",
+                "director_turn": "director_reservation_micros",
                 "render": "render_per_call_micros",
             }[kind]
             unit_rate = rate.get(key)
@@ -218,11 +220,36 @@ class StudioProvider:
             env=env,
         )
         if result.returncode:
+            from execution.director_recovery import director_failure
+
+            current = self.commands.repo.get(f"projects/{job['project_id']}/jobs/{job['job_id']}")
+            usage = director_failure(self.commands.repo, current or job)
+            if usage is not None:
+                raise ProviderFailure(
+                    "DIRECTOR_CALL_LIMIT",
+                    "The director couldn’t finish its reply. Please retry your message.",
+                    retryable=True,
+                    usage=usage,
+                )
             raise ProviderFailure("DIRECTOR_FAILED", "Director invocation failed", uncertain=True)
-        return (Composition if self.kind == "edit" else Storyboard).model_validate_json(result.stdout)
+        return (
+            DirectorTurn
+            if self.kind == "director_turn"
+            else Composition
+            if self.kind == "edit"
+            else Storyboard
+        ).model_validate_json(result.stdout)
 
     def generate(self, request, references, snapshot, job):
         caller = Caller(**job["caller"])
+        if self.kind == "director_turn":
+            if snapshot["route"] == "fixture":
+                from tools.conversation_fixture import fixture_turn
+
+                turn = fixture_turn(request, job["project_id"], job["brand_version"])
+            else:
+                turn = self._director(request, snapshot, job)
+            return ImageOutput(turn.model_dump_json().encode(), "application/json")
         if self.kind == "storyboard":
             if job.get("storyboard_override"):
                 story = Storyboard.model_validate(job["storyboard_override"])
@@ -334,7 +361,14 @@ class StudioProvider:
                 spec.expected_head = request.expected_head
                 from tools.studio_commands import validate_submission
 
-                validate_submission(self.commands, caller, job["project_id"], "composition", spec)
+                validate_submission(
+                    self.commands,
+                    caller,
+                    job["project_id"],
+                    "composition",
+                    spec,
+                    conversation_id=job.get("conversation_id"),
+                )
             else:
                 spec = request
             ids = sorted({c.artifact_id for c in spec.clips if c.artifact_id} | set(spec.fonts.values()))
@@ -524,8 +558,10 @@ class StudioProvider:
 
 
 def inspect_output(kind, data, mime):
-    if kind in {"composition", "edit", "storyboard"}:
-        if kind == "storyboard":
+    if kind in {"composition", "edit", "storyboard", "director_turn"}:
+        if kind == "director_turn":
+            DirectorTurn.model_validate_json(data)
+        elif kind == "storyboard":
             Storyboard.model_validate_json(data)
         else:
             unpack(data)

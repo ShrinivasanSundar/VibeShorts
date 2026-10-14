@@ -1,6 +1,6 @@
 import base64
 
-from fastapi import Depends
+from fastapi import Depends, Query
 
 from tools.composition.package import unpack
 from tools.contracts.models import Caller, DataResult, Mutation
@@ -8,6 +8,9 @@ from tools.contracts.studio import (
     ApprovalDecision,
     BriefInput,
     Composition,
+    ConversationAction,
+    ConversationCreate,
+    ConversationMessage,
     EditInput,
     FrameInput,
     MemberUpdate,
@@ -28,8 +31,54 @@ def install(app, commands, caller_dependency):
         return commands.submit_job(caller, body, kind)
 
     @app.get("/v1/projects/{project_id}/studio")
-    def studio(project_id: str, caller: Caller = Depends(caller_dependency)):
-        return commands.studio_state(caller, project_id)
+    def studio(
+        project_id: str, conversation_id: str | None = None, caller: Caller = Depends(caller_dependency)
+    ):
+        return commands.studio_state(caller, project_id, conversation_id)
+
+    @app.get("/v1/projects/{project_id}/conversations")
+    def conversations(
+        project_id: str,
+        limit: int = Query(30, ge=1, le=100),
+        cursor: str | None = None,
+        caller: Caller = Depends(caller_dependency),
+    ):
+        return commands.list_conversations(caller, project_id, limit, cursor)
+
+    @app.post("/v1/projects/{project_id}/conversations", status_code=201)
+    def create_conversation(
+        project_id: str, body: ConversationCreate, caller: Caller = Depends(caller_dependency)
+    ):
+        return commands.create_conversation(caller, project_id, body)
+
+    @app.get("/v1/projects/{project_id}/conversations/{conversation_id}")
+    def conversation(
+        project_id: str,
+        conversation_id: str,
+        cursor: str | None = None,
+        limit: int = Query(50, ge=1, le=100),
+        tail: bool = False,
+        caller: Caller = Depends(caller_dependency),
+    ):
+        return commands.conversation_state(caller, project_id, conversation_id, cursor, limit, tail)
+
+    @app.post("/v1/projects/{project_id}/conversations/{conversation_id}/messages", status_code=202)
+    def message(
+        project_id: str,
+        conversation_id: str,
+        body: ConversationMessage,
+        caller: Caller = Depends(caller_dependency),
+    ):
+        return commands.send_message(caller, project_id, conversation_id, body)
+
+    @app.post("/v1/projects/{project_id}/conversations/{conversation_id}/actions")
+    def conversation_action(
+        project_id: str,
+        conversation_id: str,
+        body: ConversationAction,
+        caller: Caller = Depends(caller_dependency),
+    ):
+        return commands.conversation_action(caller, project_id, conversation_id, body)
 
     @app.post("/v1/projects/{project_id}/videos", status_code=202)
     def video(project_id: str, body: StudioCommand, caller: Caller = Depends(caller_dependency)):
@@ -62,8 +111,13 @@ def install(app, commands, caller_dependency):
         return submit(caller, project_id, body, "composition")
 
     @app.get("/v1/projects/{project_id}/compositions")
-    def current(project_id: str, artifact_id: str | None = None, caller: Caller = Depends(caller_dependency)):
-        return commands.get_hyperframe(caller, project_id, artifact_id)
+    def current(
+        project_id: str,
+        artifact_id: str | None = None,
+        conversation_id: str | None = None,
+        caller: Caller = Depends(caller_dependency),
+    ):
+        return commands.get_hyperframe(caller, project_id, artifact_id, conversation_id)
 
     @app.get("/v1/projects/{project_id}/storyboards/{artifact_id}")
     def storyboard(project_id: str, artifact_id: str, caller: Caller = Depends(caller_dependency)):
@@ -82,9 +136,15 @@ def install(app, commands, caller_dependency):
 
     @app.post("/v1/projects/{project_id}/compositions/{artifact_id}/review")
     def review(
-        project_id: str, artifact_id: str, body: Mutation, caller: Caller = Depends(caller_dependency)
+        project_id: str,
+        artifact_id: str,
+        body: Mutation,
+        conversation_id: str | None = None,
+        caller: Caller = Depends(caller_dependency),
     ):
-        return commands.request_preview_approval(caller, project_id, artifact_id, body.idempotency_key)
+        return commands.request_preview_approval(
+            caller, project_id, artifact_id, body.idempotency_key, conversation_id
+        )
 
     @app.get("/v1/projects/{project_id}/compositions/{artifact_id}/preview")
     def preview(project_id: str, artifact_id: str, caller: Caller = Depends(caller_dependency)):

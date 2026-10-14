@@ -52,6 +52,7 @@ class ImageInput(Contract):
 
 class ImageCommand(Contract):
     project_id: str
+    conversation_id: str | None = None
     idempotency_key: str = Field(min_length=1, max_length=200)
     input: ImageInput
 
@@ -87,7 +88,9 @@ class Artifact(Contract):
     job_id: str | None = None
     parent_id: str | None = None
     input_artifact_ids: list[str] = Field(default_factory=list)
-    type: Literal["image", "video", "audio", "composition", "storyboard", "font", "render"] = "image"
+    type: Literal[
+        "image", "video", "audio", "composition", "storyboard", "font", "render", "director_turn"
+    ] = "image"
     title: str
     storage_uri: str
     content_sha256: str
