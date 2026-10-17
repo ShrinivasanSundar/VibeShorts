@@ -4,6 +4,7 @@ import zipfile
 import pytest
 from pydantic import ValidationError
 
+from execution.dispatch import Reconciler
 from execution.runtime import Runtime
 from execution.workflow import WorkflowScheduler
 from providers.image import ImageOutput
@@ -396,6 +397,44 @@ def test_rest_import_preview_and_scoped_storyboard_read(runtime, alice, bob, pro
         assert http.get(base + "/studio").json()["data"]["provider_route"] == "fixture"
     with pytest.raises(AppError, match="permission"):
         runtime.commands.get_storyboard(bob, project, "nonexistent")
+
+
+def test_workflow_resumes_after_uncertain_output_is_recovered(runtime, alice, project, monkeypatch):
+    class ProcessDied(BaseException):
+        pass
+
+    candidate = []
+    put = runtime.commands.storage.put
+
+    def delayed_upload(*args):
+        candidate.extend(args)
+        raise ProcessDied()
+
+    handle = runtime.commands.create_video(
+        alice,
+        StudioCommand(
+            project_id=project,
+            idempotency_key="recover-plan",
+            input=BriefInput(brief="A robot story", duration_seconds=6),
+        ),
+    )
+    monkeypatch.setattr(runtime.commands.storage, "put", delayed_upload)
+    with pytest.raises(ProcessDied):
+        runtime.worker.execute(project, handle.job_id)
+    runtime.commands.clock.advance()
+    Reconciler(runtime.commands).sweep()
+    assert runtime.commands.get_run(alice, project, handle.run_id).status == "needs_reconciliation"
+    monkeypatch.setattr(runtime.commands.storage, "put", put)
+    put(*candidate)
+    Reconciler(runtime.commands).sweep()
+    runtime.worker.execute(project, handle.job_id)
+    WorkflowScheduler(runtime.commands).sweep()
+    job = runtime.commands.get_job(alice, project, handle.job_id)
+    run = runtime.commands.get_run(alice, project, handle.run_id)
+    assert job.status == "succeeded"
+    assert run.status == "needs_approval"
+    assert run.approval["kind"] == "storyboard"
+    assert len(runtime.commands.repo.list(project_path(project, "jobs"))) == 1
 
 
 def test_cancelled_workflow_cannot_be_revived_by_scheduler(runtime, alice, project):

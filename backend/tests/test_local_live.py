@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +12,33 @@ from api.main import create_app
 from execution import cli
 from execution.config import Settings
 from execution.integrations import check_integrations
+from execution.paths import REPO_ROOT
+
+
+@pytest.mark.parametrize("custom_python", [False, True])
+def test_live_startup_checks_director_environment(tmp_path, custom_python):
+    script = tmp_path / "scripts/dev-live.sh"
+    script.parent.mkdir()
+    script.write_text((REPO_ROOT / "scripts/dev-live.sh").read_text())
+    python = tmp_path / "backend/.venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\necho integration-check-ran\n")
+    python.chmod(0o755)
+    (tmp_path / "backend/.env.production").write_text("VIBESHORTS_RENDER_RUNNER=local\n")
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend/.env.production.local").write_text("")
+    env = dict(os.environ)
+    env.pop("VIBESHORTS_ADK_PYTHON", None)
+    if custom_python:
+        env["VIBESHORTS_ADK_PYTHON"] = sys.executable
+    result = subprocess.run(["bash", str(script), "--check"], env=env, capture_output=True, text=True)
+    if custom_python:
+        assert result.returncode == 0, result.stderr
+        assert "integration-check-ran" in result.stdout
+    else:
+        assert result.returncode == 1
+        assert "uv sync --project backend/agents/creative_director --frozen" in result.stderr
+        assert "integration-check-ran" not in result.stdout
 
 
 def live_settings(**overrides):

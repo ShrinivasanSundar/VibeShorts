@@ -18,6 +18,10 @@ if ! command -v docker >/dev/null 2>&1 && [ -x /usr/local/bin/docker ]; then
   export PATH="/usr/local/bin:$PATH"
 fi
 if [ -d .cache/node/node_modules/.bin ]; then export PATH="$PWD/.cache/node/node_modules/.bin:$PATH"; fi
+if ! command -v "${VIBESHORTS_ADK_PYTHON:-$PWD/backend/agents/creative_director/.venv/bin/python}" >/dev/null 2>&1; then
+  echo "Creative director environment missing. Run: uv sync --project backend/agents/creative_director --frozen" >&2
+  exit 1
+fi
 backend/.venv/bin/python backend/scripts/check-integrations.py \
   --backend-env backend/.env.production --frontend-env frontend/.env.production.local --image-only
 if [ "${VIBESHORTS_RENDER_RUNNER:-}" = docker ]; then

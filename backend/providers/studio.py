@@ -236,14 +236,24 @@ class StudioProvider:
             env["VIBESHORTS_VERTEX_CREDENTIALS"] = self.settings.vertex_credentials
         if snapshot["route"] == "developer":
             env["VIBESHORTS_DIRECTOR_API_KEY"] = self.settings.developer_api_key
-        result = subprocess.run(
-            [self.settings.adk_python, str(BACKEND_ROOT / "agents/creative_director/direct.py")],
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
-            timeout=90,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                [self.settings.adk_python, str(BACKEND_ROOT / "agents/creative_director/direct.py")],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=90,
+                env=env,
+            )
+        except (FileNotFoundError, PermissionError) as exc:
+            # The child never started, so no provider request or charge is possible.
+            raise ProviderFailure(
+                "DIRECTOR_UNAVAILABLE",
+                "Creative director could not start. Run: "
+                "uv sync --project backend/agents/creative_director --frozen; "
+                "check VIBESHORTS_ADK_PYTHON if configured.",
+                retryable=True,
+            ) from exc
         if result.returncode:
             from execution.director_recovery import director_failure
             from execution.telemetry import event

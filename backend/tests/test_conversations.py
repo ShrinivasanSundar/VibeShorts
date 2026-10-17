@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import create_app
-from execution.dispatch import Dispatcher, Reconciler, handle
+from execution.dispatch import Dispatcher, Reconciler, handle, reconcile_decision
 from execution.runtime import Runtime
 from execution.workflow import WorkflowScheduler
 from providers.image import ImageOutput
@@ -13,6 +13,7 @@ from tools.commands import project_path
 from tools.contracts.errors import AppError
 from tools.contracts.studio import (
     ApprovalDecision,
+    BriefInput,
     Composition,
     ConversationAction,
     ConversationCreate,
@@ -362,6 +363,59 @@ def test_standalone_retry_rejects_wrong_video_and_uncertain_submission(runtime, 
         runtime.commands.conversation_action(alice, project, another, body)
     with pytest.raises(AppError, match="confirmed failed"):
         runtime.commands.conversation_action(alice, project, chat, body)
+
+
+@pytest.mark.parametrize("second_uncertain_job", [False, True])
+def test_reconciled_workflow_can_be_retried_only_after_all_uncertainty_is_resolved(
+    runtime, alice, project, chat, second_uncertain_job
+):
+    from tools.contracts.models import ImageCommand, ImageInput
+
+    handle = runtime.commands.create_video(
+        alice,
+        StudioCommand(
+            project_id=project,
+            conversation_id=chat,
+            idempotency_key="uncertain-plan",
+            input=BriefInput(brief="A robot story", duration_seconds=6),
+        ),
+    )
+    jobs = [handle]
+    if second_uncertain_job:
+        jobs.append(
+            runtime.commands.submit_job(
+                alice,
+                ImageCommand(
+                    project_id=project,
+                    conversation_id=chat,
+                    idempotency_key="uncertain-image",
+                    input=ImageInput(prompt="A robot"),
+                ),
+                "image",
+                parent_run=handle.run_id,
+            )
+        )
+    for job in jobs:
+        runtime.worker.fail(
+            runtime.worker.claim(project, job.job_id), AppError("UNKNOWN", "Unknown"), uncertain=True
+        )
+    for index, job in enumerate(jobs):
+        reconcile_decision(runtime.commands, project, job.job_id, 0, "Fixture: no provider called", "test")
+        WorkflowScheduler(runtime.commands).sweep()
+        run = runtime.commands.get_run(alice, project, handle.run_id)
+        if index < len(jobs) - 1:
+            assert run.status == "needs_reconciliation"
+            with pytest.raises(AppError, match="confirmed failed"):
+                runtime.commands.conversation_action(
+                    alice, project, chat, ConversationAction(idempotency_key="blocked", action="retry")
+                )
+    assert run.status == "failed"
+    runtime.commands.conversation_action(
+        alice, project, chat, ConversationAction(idempotency_key="retry-reconciled", action="retry")
+    )
+    tick(runtime, project, 3)
+    recovered = state(runtime, alice, project, chat)
+    assert recovered["run"]["approval"]["kind"] == "storyboard"
 
 
 @pytest.mark.parametrize("terminal_invocation", ["current", "unrelated"])

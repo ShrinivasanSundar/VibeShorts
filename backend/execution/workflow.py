@@ -24,7 +24,7 @@ class WorkflowScheduler:
         from execution.dispatch import live_matches
 
         ConversationScheduler(self.commands).sweep()
-        active = ["queued", "running", "waiting_for_jobs"]
+        active = ["queued", "running", "waiting_for_jobs", "needs_reconciliation"]
         for project_id, run in live_matches(self.commands.repo, "runs", "status", active):
             self.resume(project_id, run)
 
@@ -37,9 +37,29 @@ class WorkflowScheduler:
             "cancelled",
             "failed",
             "succeeded",
-            "needs_reconciliation",
         }:
             return True
+        if run["status"] == "needs_reconciliation":
+
+            def reconciled(tx):
+                path = project_path(project_id, "runs", run["run_id"])
+                current = tx.get(path)
+                if not current or current["status"] != "needs_reconciliation":
+                    return current
+                jobs = [
+                    tx.get(project_path(project_id, "jobs", job_id))
+                    for job_id in current.get("job_ids", [current["job_id"]])
+                ]
+                if any(not job or job["status"] == "submission_unknown" for job in jobs):
+                    return None
+                current.update(status="waiting_for_jobs", version=current["version"] + 1)
+                tx.set(path, current)
+                self.commands.project_run(tx, current)
+                return current
+
+            run = self.commands.repo.atomic(reconciled)
+            if not run:
+                return True
         try:
             return self.advance(project_id, run["run_id"])
         except Exception as exc:

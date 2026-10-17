@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,15 @@ from execution.director_environment import prepare_environment
 from execution.identity import FirebaseIdentity
 from providers.credentials import vertex_credentials
 from providers.studio import StudioProvider
-from tools.contracts.studio import Composition, EditInput, MusicInput, VideoInput
+from tools.contracts.models import ProjectCreate
+from tools.contracts.studio import (
+    Composition,
+    ConversationInput,
+    EditInput,
+    MusicInput,
+    StudioCommand,
+    VideoInput,
+)
 
 
 @pytest.mark.parametrize("duration", [4, 6, 8])
@@ -236,6 +245,51 @@ def test_director_payload_keeps_application_and_model_projects_separate(monkeypa
     assert payload["vertex_project"] == "vertex-project"
     assert seen["env"]["VIBESHORTS_VERTEX_CREDENTIALS"] == "/private/vertex.json"
     assert "/private/vertex.json" not in seen["input"]
+
+
+@pytest.mark.parametrize(
+    "failure,status,code",
+    [
+        (FileNotFoundError("missing Python"), "failed", "DIRECTOR_UNAVAILABLE"),
+        (PermissionError("Python is not executable"), "failed", "DIRECTOR_UNAVAILABLE"),
+        (OSError("subprocess I/O failed"), "submission_unknown", "PROVIDER_SUBMISSION_UNCERTAIN"),
+        (subprocess.TimeoutExpired("director", 90), "submission_unknown", "PROVIDER_SUBMISSION_UNCERTAIN"),
+    ],
+)
+def test_director_start_failure_releases_budget_but_timeout_stays_uncertain(
+    runtime, alice, monkeypatch, failure, status, code
+):
+    commands = runtime.commands
+    commands.settings = split_settings()
+    project = commands.create_project(
+        alice, ProjectCreate(name="Director failure", idempotency_key="director-failure")
+    ).data["project_id"]
+    handle = commands.submit_job(
+        alice,
+        StudioCommand(
+            project_id=project,
+            idempotency_key="turn",
+            input=ConversationInput(instruction="A robot story"),
+        ),
+        "director_turn",
+    )
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr("providers.studio.subprocess.run", fail)
+    runtime.worker.execute(project, handle.job_id)
+    job = commands.get_job(alice, project, handle.job_id)
+    assert job.status == status
+    assert job.error.code == code
+    uncertain = status == "submission_unknown"
+    assert job.costs["uncertain"] == uncertain
+    assert job.costs["reserved_micros"] == int(uncertain)
+    assert job.costs["settled_micros"] == 0
+    assert commands.repo.get("budgets/account")["reserved_micros"] == int(uncertain)
+    assert commands.repo.get("budgets/" + project)["reserved_micros"] == int(uncertain)
+    if not uncertain:
+        assert job.error.retryable
 
 
 @pytest.mark.parametrize("separate_credentials", [False, True])
