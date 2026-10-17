@@ -11,15 +11,10 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY frontend/package.json frontend/package.json
 RUN npm ci --ignore-scripts --no-audit --no-fund
-RUN if [ "$(uname -m)" = "aarch64" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends chromium \
-      && rm -rf /var/lib/apt/lists/* \
-      && ln -s /usr/bin/chromium /usr/local/bin/hyperframes-chrome; \
-    else \
-      node_modules/.bin/hyperframes browser ensure \
-      && ln -s "$(node_modules/.bin/hyperframes browser path)" /usr/local/bin/hyperframes-chrome \
-      && chmod -R a+rX /root/.cache && chmod o+x /root; \
-    fi
+# Debian's Chromium on every architecture; `hyperframes browser ensure` can hang after its download.
+RUN apt-get update && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/chromium /usr/local/bin/hyperframes-chrome
 COPY backend/pyproject.toml backend/uv.lock backend/
 RUN uv sync --project backend --frozen --no-dev --no-install-project
 COPY backend/tools backend/tools

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { call, request } from "../lib/api";
+import { LoadingState } from "./loading-state";
 
 type Project = { project_id: string; name: string; brand_version: string | null };
 type Capabilities = { route: string; model: string; deprecated: boolean };
@@ -70,7 +71,7 @@ export function ProjectPanel({ projectId }: { projectId: string }) {
 
   return <div className="project-detail">
     <Link className="back-link" href="/">← All projects</Link>
-    {loading && !project && <p className="muted" role="status">Loading project…</p>}
+    {loading && !project && <LoadingState label="Loading project…" />}
     {project && <>
       <h2 className="project-title">{project.name}</h2>
       <dl className="project-facts">

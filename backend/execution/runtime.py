@@ -2,6 +2,7 @@ import os
 
 from api.oauth import OAuthBroker
 from execution.config import Settings
+from execution.dispatch import PubSubPublisher
 from execution.identity import FirebaseIdentity
 from execution.repository import FirestoreRepository
 from execution.storage import CloudStorage
@@ -33,12 +34,12 @@ class Runtime:
                     "Fixture emulator execution requires a demo- project to avoid live service access"
                 )
         provider = FixtureImageProvider() if settings.provider == "fixture" else VertexImageProvider(settings)
-        return cls(
-            Commands(
-                FirestoreRepository(settings.google_cloud_project),
-                CloudStorage(settings),
-                FirebaseIdentity(settings),
-                provider,
-                settings,
-            )
+        commands = Commands(
+            FirestoreRepository(settings.google_cloud_project),
+            CloudStorage(settings),
+            FirebaseIdentity(settings),
+            provider,
+            settings,
         )
+        commands.publisher = PubSubPublisher(settings)
+        return cls(commands)

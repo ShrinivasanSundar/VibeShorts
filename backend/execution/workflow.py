@@ -1,5 +1,6 @@
 """Durable dependency scheduler. No resident director or creative planning loop."""
 
+from execution.telemetry import event
 from tools.commands import identifier, project_path
 from tools.contracts.errors import AppError
 from tools.contracts.models import Caller, ImageCommand, ImageInput
@@ -20,32 +21,43 @@ class WorkflowScheduler:
         self.commands = commands
 
     def sweep(self):
+        from execution.dispatch import live_matches
+
         ConversationScheduler(self.commands).sweep()
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
-                continue
-            for run in self.commands.repo.list_where(
-                project_path(project["project_id"], "runs"),
-                "status",
-                ["queued", "running", "waiting_for_jobs"],
-            ):
-                if run.get("workflow") and run["status"] not in {
-                    "cancelled",
-                    "failed",
-                    "succeeded",
-                    "needs_reconciliation",
-                }:
-                    try:
-                        self.advance(project["project_id"], run["run_id"])
-                    except AppError as exc:
-                        if exc.payload.code == "STALE_SCHEDULER":
-                            continue
-                        self.change(
-                            project["project_id"],
-                            run["run_id"],
-                            status="failed",
-                            error=exc.payload.model_dump(),
-                        )
+        active = ["queued", "running", "waiting_for_jobs"]
+        for project_id, run in live_matches(self.commands.repo, "runs", "status", active):
+            self.resume(project_id, run)
+
+    def resume(self, project_id, run):
+        """Advance one workflow run, recording an application failure on the run.
+
+        Returns False when another pass holds the run's lease, so an event can be redelivered.
+        """
+        if not run.get("workflow") or run["status"] in {
+            "cancelled",
+            "failed",
+            "succeeded",
+            "needs_reconciliation",
+        }:
+            return True
+        try:
+            return self.advance(project_id, run["run_id"])
+        except Exception as exc:
+            # A run erased mid-pass is skipped rather than stopping the worker.
+            if not self.commands.repo.get(project_path(project_id, "runs", run["run_id"])):
+                return True
+            if not isinstance(exc, AppError):
+                raise
+            if exc.payload.code == "STALE_SCHEDULER":
+                return True
+            event("run_failed", run_id=run["run_id"], code=exc.payload.code, message=exc.payload.message)
+            self.change(
+                project_id,
+                run["run_id"],
+                status="failed",
+                error=exc.payload.model_dump(),
+            )
+            return True
 
     def change(self, project, run_id, *, owner=None, **values):
         def apply(tx):
@@ -63,6 +75,8 @@ class WorkflowScheduler:
             run["version"] += 1
             tx.set(path, run)
             self.commands.project_run(tx, run)
+            if run.get("conversation_id"):
+                self.commands.enqueue_advance(tx, project, "conversation", run["conversation_id"])
             tx.set(
                 project_path(project, "events", f"{run_id}_{run['version']:012d}"),
                 {
@@ -115,37 +129,52 @@ class WorkflowScheduler:
                 run["version"] += 1
                 tx.set(path, run)
                 self.commands.project_run(tx, run)
+                if run.get("conversation_id"):
+                    self.commands.enqueue_advance(tx, project, "conversation", run["conversation_id"])
                 return False
             return approval["decision"] == "approved"
 
         return self.commands.repo.atomic(apply)
 
     def advance(self, project, run_id):
+        """One scheduler pass. Returns False only when another pass holds the run's lease."""
         owner = identifier("scheduler")
+        busy = object()
 
         def claim(tx):
             path = project_path(project, "runs", run_id)
             run = tx.get(path)
-            if (
-                run["status"] in {"cancelled", "failed", "succeeded"}
-                or run.get("scheduler_expiry", 0) > self.commands.clock()
-            ):
+            if not run or run["status"] in {"cancelled", "failed", "succeeded"}:
                 return None
-            run.update(scheduler_owner=owner, scheduler_expiry=self.commands.clock() + 30)
+            if run.get("scheduler_expiry", 0) > self.commands.clock():
+                return busy
+            # One pass makes many sequential Firestore round trips (~40 s for a few scenes over a
+            # transcontinental link). A lease shorter than the pass makes its final save stale and
+            # silently drops every child it linked. The lease is released when the pass ends.
+            run.update(scheduler_owner=owner, scheduler_expiry=self.commands.clock() + 300)
             tx.set(path, run)
             return run
 
         run = self.commands.repo.atomic(claim)
+        if run is busy:
+            return False
         if not run:
-            return
+            return True
         try:
             self._advance(project, run)
+            return True
+        except Exception as exc:
+            if not (isinstance(exc, AppError) and exc.payload.code == "STALE_SCHEDULER"):
+                # Children submitted earlier in this pass live only in run["workflow"]; keep them
+                # linked so their media still appears even though the pass failed.
+                self.change(project, run_id, workflow=run["workflow"])
+            raise
         finally:
 
             def release(tx):
                 path = project_path(project, "runs", run_id)
                 current = tx.get(path)
-                if current.get("scheduler_owner") == owner:
+                if current and current.get("scheduler_owner") == owner:
                     current["scheduler_expiry"] = 0
                     tx.set(path, current)
 

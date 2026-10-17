@@ -23,6 +23,7 @@ from tools.contracts.models import (
     RunResult,
 )
 from tools.conversations import ConversationCommands, conversation_path
+from tools.deletion import DeletionCommands
 from tools.studio_commands import StudioCommands
 
 
@@ -51,10 +52,48 @@ def project_path(project_id, collection=None, record_id=None):
     return path
 
 
-class Commands(StudioCommands, ConversationCommands):
+class Commands(StudioCommands, ConversationCommands, DeletionCommands):
     def __init__(self, repo, storage, identity, provider, settings, clock=time.time):
         self.repo, self.storage, self.identity = repo, storage, identity
         self.provider, self.settings, self.clock = provider, settings, clock
+        # Set by processes that can publish; without it the scheduled dispatch sends the outbox.
+        self.publisher = None
+
+    def enqueue_advance(self, tx, project_id, target, target_id):
+        """Ask for one scheduler pass of a run or conversation; the periodic sweep stays the fallback.
+
+        The row id is fixed per target, so triggers arriving before dispatch coalesce into one message.
+        """
+        outbox_id = f"advance_{target}_{target_id}"
+        tx.set(
+            project_path(project_id, "outbox", outbox_id),
+            {
+                "id": outbox_id,
+                "kind": "advance",
+                "target": target,
+                "target_id": target_id,
+                # Distinguishes a re-request from the row a dispatcher is about to mark sent.
+                "nonce": identifier("advance"),
+                "project_id": project_id,
+                "status": "pending",
+                "next_attempt_at": self.clock(),
+                "attempts": 0,
+                "created_at": self.clock(),
+            },
+        )
+
+    def flush(self, project_id):
+        """Publish a project's due outbox rows now instead of at the next scheduled dispatch."""
+        if self.publisher is None:
+            return 0
+        from execution.dispatch import Dispatcher
+
+        try:
+            return Dispatcher(self, self.publisher).dispatch(project_id)
+        except Exception as exc:
+            # The rows are committed; the scheduled dispatch still sends them.
+            event("outbox_flush_failure", project_id=project_id, exception_type=type(exc).__name__)
+            return 0
 
     def provision(self, caller: Caller):
         self.identity.check_uid(caller.uid, caller.auth_time)
@@ -74,9 +113,15 @@ class Commands(StudioCommands, ConversationCommands):
                 raise AppError("ACCESS_DENIED", "Application access is disabled", 403)
             return user
 
-        return self.repo.atomic(apply)
+        # Existing users need only a read; the transaction is reserved for first sign-in.
+        user = self.repo.get("users/" + checked_id(caller.uid))
+        if user is None:
+            return self.repo.atomic(apply)
+        if not user["access_enabled"]:
+            raise AppError("ACCESS_DENIED", "Application access is disabled", 403)
+        return user
 
-    def authorize(self, caller: Caller, project_id: str, scope=READ, tx=None):
+    def authorize(self, caller: Caller, project_id: str, scope=READ, tx=None, deleting_ok=False):
         self.identity.check_uid(caller.uid, caller.auth_time)
         read = tx.get if tx else self.repo.get
         user = read("users/" + checked_id(caller.uid))
@@ -89,6 +134,8 @@ class Commands(StudioCommands, ConversationCommands):
             if not grant or grant.get("revoked") or grant["access_version"] != user["access_version"]:
                 raise AppError("ACCESS_DENIED", "MCP grant revoked", 403)
         project = read(project_path(project_id))
+        if project and project.get("deleting") and not deleting_ok:
+            raise AppError("NOT_FOUND", "Project not found", 404)
         role = (project or {}).get("members", {}).get(caller.uid)
         if not role or (scope != READ and role not in {"owner", "editor"}):
             raise AppError("ACCESS_DENIED", "Project permission denied", 403)
@@ -176,8 +223,10 @@ class Commands(StudioCommands, ConversationCommands):
             data={
                 "projects": [
                     {k: p[k] for k in ("project_id", "name", "brand_version")}
-                    for p in self.repo.list("projects")
-                    if caller.uid in p["members"]
+                    for p in self.repo.list_where(
+                        "projects", ("members", caller.uid), ["owner", "editor", "viewer"]
+                    )
+                    if not p.get("deleting")
                     and (caller.projects is None or p["project_id"] in caller.projects)
                 ]
             }
@@ -550,18 +599,19 @@ class Commands(StudioCommands, ConversationCommands):
 
     def get_run(self, caller, project_id, run_id):
         self.authorize(caller, project_id)
+        return self._load_run(project_id, run_id)
+
+    def _load_run(self, project_id, run_id):
+        """Run result for an already-authorized caller, read in two batched round trips."""
         run = self.repo.get(project_path(project_id, "runs", run_id))
         if not run:
             raise AppError("NOT_FOUND", "Run not found", 404)
-        jobs = [
-            self.repo.get(project_path(project_id, "jobs", j)) for j in run.get("job_ids", [run["job_id"]])
-        ]
-        approval = (
-            self.repo.get(project_path(project_id, "approvals", run["pending_approval_id"]))
-            if run.get("pending_approval_id")
-            else None
-        )
-        return self._run_result(run, jobs, approval)
+        paths = [project_path(project_id, "jobs", j) for j in run.get("job_ids", [run["job_id"]])]
+        if run.get("pending_approval_id"):
+            paths.append(project_path(project_id, "approvals", run["pending_approval_id"]))
+        documents = self.repo.get_many(paths)
+        approval = documents.pop() if run.get("pending_approval_id") else None
+        return self._run_result(run, documents, approval)
 
     @staticmethod
     def _run_result(run, jobs, approval):
@@ -660,6 +710,13 @@ class Commands(StudioCommands, ConversationCommands):
         run["version"] += 1
         tx.set(run_path, run)
         self.project_run(tx, run)
+        if status in {"succeeded", "failed", "cancelled", "submission_unknown"}:
+            # A finished job may unblock its workflow and changes what its conversation shows.
+            if run.get("workflow"):
+                self.enqueue_advance(tx, job["project_id"], "run", run["run_id"])
+            conversation_id = job.get("conversation_id") or run.get("conversation_id")
+            if conversation_id:
+                self.enqueue_advance(tx, job["project_id"], "conversation", conversation_id)
         step_path = project_path(job["project_id"], "steps", job["step_id"])
         step = tx.get(step_path)
         step["status"] = status
@@ -765,10 +822,17 @@ class Commands(StudioCommands, ConversationCommands):
                 after = checked_id(decoded["after"])
             except Exception as exc:
                 raise AppError("INVALID_INPUT", "Invalid asset cursor") from exc
-        artifacts = self.repo.page(project_path(project_id, "artifacts"), limit + 1, after)
+        collection = project_path(project_id, "artifacts")
+        artifacts = (
+            self.repo.page_where(collection, "type", type, limit + 1, after)
+            if type
+            else self.repo.page(collection, limit + 1, after)
+        )
+        lifecycles = self.repo.get_many(
+            [project_path(project_id, "artifact_lifecycle", a["id"]) for a in artifacts[:limit]]
+        )
         ready = []
-        for artifact in artifacts[:limit]:
-            lifecycle = self.repo.get(project_path(project_id, "artifact_lifecycle", artifact["id"]))
+        for artifact, lifecycle in zip(artifacts[:limit], lifecycles, strict=True):
             if (
                 artifact["id"] > after
                 and lifecycle

@@ -2,42 +2,94 @@
 
 import dynamic from "next/dynamic";
 import { useState } from "react";
-import { Check, Clapperboard, Sparkles } from "lucide-react";
+import { Check, Clapperboard, Sparkles, Trash2 } from "lucide-react";
 import { useWorkspace } from "../lib/workspace";
 import type { ConversationState, ProductionStep } from "../lib/studio-types";
 import { PrivateMedia } from "./private-media";
+import { LoadingState } from "./loading-state";
 
 const CompositionPreview = dynamic(() =>
   import("./preview").then((m) => m.CompositionPreview),
 );
+// Steps carry job statuses; anything not settled or unstarted is being worked on.
 const active = (step: ProductionStep) =>
-  ["queued", "running", "waiting_for_jobs"].includes(step.status);
+  ![
+    "pending",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "submission_unknown",
+  ].includes(step.status);
+const jobLabels: Record<string, string> = {
+  succeeded: "Ready",
+  submission_unknown: "Checking provider request",
+  pending: "Waiting",
+  queued: "Queued",
+  claimed: "Starting",
+  submitting: "Sending to model",
+  waiting_for_provider: "Generating",
+  materializing: "Saving",
+};
 const label = (step: ProductionStep) =>
-  step.status === "succeeded"
-    ? "Ready"
-    : step.status === "submission_unknown"
-      ? "Checking provider request"
-      : step.status === "pending"
-        ? "Waiting"
-        : step.status.replaceAll("_", " ");
+  jobLabels[step.status] || step.status.replaceAll("_", " ");
+const ago = (seconds: number) =>
+  seconds < 60
+    ? `${seconds}s ago`
+    : seconds < 3600
+      ? `${Math.floor(seconds / 60)}m ago`
+      : `${Math.floor(seconds / 3600)}h ago`;
+// Video generation polls rewrite updated_at, so elapsed time counts from job creation.
+const elapsed = (step: ProductionStep, now: number) => {
+  if (!step.created_at) return "";
+  const seconds = Math.max(0, Math.round(now - step.created_at));
+  return seconds < 60
+    ? ` ${seconds}s`
+    : ` ${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+};
 
 export function ProductionPlan({ state }: { state?: ConversationState }) {
   const p = state?.production;
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 10000);
+    return () => clearInterval(timer);
+  }, []);
   if (!p?.storyboard) return null;
   const frames = p.scenes.map((scene) => scene.frame),
     scenes = p.scenes.map((scene) =>
       scene.video.status === "pending" ? scene.generation : scene.video,
     );
-  const group = (steps: ProductionStep[]) =>
-    steps.length && steps.every((step) => step.status === "succeeded")
+  const group = (steps: ProductionStep[]) => {
+    const ready = steps.filter((step) => step.status === "succeeded").length;
+    const count = steps.length > 1 ? ` · ${ready}/${steps.length}` : "";
+    return steps.length && ready === steps.length
       ? "Ready"
       : steps.some((step) => step.status === "failed")
-        ? "Needs attention"
+        ? "Needs attention" + count
         : steps.some((step) => step.status === "submission_unknown")
-          ? "Checking request"
+          ? "Checking request" + count
           : steps.some(active)
-            ? "In progress"
-            : "Waiting";
+            ? "In progress" + count
+            : "Waiting" + count;
+  };
+  const tracked = [
+    ...p.scenes.flatMap((scene, i) => [
+      [`Scene ${i + 1} frame`, scene.frame],
+      [`Scene ${i + 1} video`, scene.generation],
+      [`Scene ${i + 1} trim`, scene.video],
+    ]),
+    ["Music", p.music_generation],
+    ["Music trim", p.music],
+    ["Composition", p.composition],
+    ["Draft render", p.draft],
+  ] as [string, ProductionStep][];
+  const done = tracked.filter(([, step]) => step.status === "succeeded").length;
+  const working = tracked.filter(([, step]) => active(step));
+  const failed = tracked.find(([, step]) => step.status === "failed");
+  const lastUpdate = Math.max(
+    0,
+    ...tracked.map(([, step]) => step.updated_at || 0),
+  );
   const steps = [
     [
       "Plan",
@@ -82,6 +134,23 @@ export function ProductionPlan({ state }: { state?: ConversationState }) {
           </li>
         ))}
       </ol>
+      {state?.run?.workflow?.stage !== "storyboard" && (
+        <p className="production-progress" role="status" aria-live="polite">
+          {done}/{tracked.length} steps done
+          {failed
+            ? ` · ${failed[0]} failed: ${failed[1].error?.message || "unknown error"}`
+            : working.length
+              ? ` · ${working
+                  .slice(0, 3)
+                  .map(([name, step]) => `${name}: ${label(step)}${elapsed(step, now)}`)
+                  .join(
+                    ", ",
+                  )}${working.length > 3 ? ` +${working.length - 3} more` : ""}`
+              : ""}
+          {lastUpdate > 0 &&
+            ` · last update ${ago(Math.max(0, Math.round(now - lastUpdate)))}`}
+        </p>
+      )}
       {p.affected_scene_ids.length > 0 && (
         <p>
           Scenes to regenerate: {p.affected_scene_ids.join(", ")}. Other
@@ -96,13 +165,17 @@ export function ProductionView({
   state,
   onEdit,
   onRevise,
+  onDeleteScene,
   onExport,
   busy,
+  loading,
   pendingPreview,
 }: {
   state?: ConversationState;
+  loading: boolean;
   onEdit: () => void;
   onRevise: (scene?: string) => void;
+  onDeleteScene: (scene: string, label: string) => void;
   onExport: () => void;
   busy: boolean;
   pendingPreview: boolean;
@@ -124,6 +197,7 @@ export function ProductionView({
           ? "scenes"
           : "storyboard";
   const view = selected || current;
+  const sceneCount = p?.scenes.length || 0;
   const originalComposition = state?.run?.workflow?.composition_artifact_id;
   const draft = p?.draft.artifact_id;
   return (
@@ -152,7 +226,9 @@ export function ProductionView({
           </button>
         )}
       </header>
-      {!p?.storyboard && !head ? (
+      {loading ? (
+        <LoadingState className="centered" label="Loading your video…" />
+      ) : !p?.storyboard && !head ? (
         <div className="workspace-pending">
           <Sparkles size={28} />
           <h2>Let’s shape your story</h2>
@@ -252,12 +328,32 @@ export function ProductionView({
                       {step.error.message}
                     </p>
                   )}
-                  <button
-                    className="chat-button"
-                    onClick={() => onRevise(scene.id)}
-                  >
-                    Revise scene
-                  </button>
+                  <div className="scene-card-actions">
+                    <button
+                      className="chat-button"
+                      onClick={() => onRevise(scene.id)}
+                    >
+                      Revise scene
+                    </button>
+                    <button
+                      className="delete-button"
+                      disabled={busy || sceneCount <= 3}
+                      aria-label={`Delete scene ${i + 1}`}
+                      title={
+                        sceneCount <= 3
+                          ? "A video needs at least 3 scenes"
+                          : "Delete scene"
+                      }
+                      onClick={() =>
+                        onDeleteScene(
+                          scene.id,
+                          `scene ${i + 1} (${scene.objective})`,
+                        )
+                      }
+                    >
+                      <Trash2 size={15} aria-hidden="true" />
+                    </button>
+                  </div>
                 </article>
               );
             })}
@@ -367,7 +463,7 @@ function AudioPreview({ artifactId }: { artifactId: string }) {
           onPlay={() => audio.current && claimPlayback(audio.current)}
         />
       ) : (
-        <p>Loading music…</p>
+        <LoadingState label="Loading music…" />
       )}
       {wave.length > 0 && (
         <div className="audio-waveform" aria-hidden="true">

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { request } from "../lib/api";
 import { projectRoot } from "../lib/workspace";
+import { Reel } from "./loading-state";
 
 // A shared play event also pauses compositions in the editor and historical cards.
 export function claimPlayback(owner: object) {
@@ -61,7 +62,8 @@ export function PrivateMedia({
   if (!url)
     return (
       <div className="chat-media-loading" role="status">
-        Loading preview…
+        <Reel />
+        <span>Loading preview…</span>
       </div>
     );
   return image ? (

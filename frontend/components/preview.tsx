@@ -5,6 +5,7 @@ import { Brand } from "./brand";
 import { useStudio } from "../lib/studio-store";
 import { call } from "../lib/api";
 import { claimPlayback } from "./private-media";
+import { Reel } from "./loading-state";
 
 type Player = HTMLElement & {play:()=>void;pause:()=>void;seek:(time:number)=>void;currentTime:number;srcdoc:string;iframeElement?:HTMLIFrameElement};
 export function CompositionPreview({projectId,artifactId,independent=false}:{projectId:string;artifactId:string|null;independent?:boolean}) {
@@ -35,7 +36,7 @@ export function CompositionPreview({projectId,artifactId,independent=false}:{pro
   useEffect(()=>{if(player.current&&!s.playing)player.current.seek(s.time);},[s.time,s.playing]);
   return <section className="preview-area"><div className="preview-mat"><div className={`preview-canvas ${s.timeline.aspect_ratio==="16:9"?"landscape":""}`} ref={container}/>
     {!artifactId&&<div className="preview-placeholder"><span className="preview-symbol"><Brand compact /></span><span className="eyebrow preview-eyebrow">THINK IT. MAKE IT MOVE.</span><h2>Your story, in motion.</h2><p>Start with a brief, or build your own cut.<br/>Your composition will appear here.</p><div className="preview-grid"/></div>}
-    {artifactId&&!ready&&!error&&<div className="preview-loading" role="status">Loading private composition…</div>}
+    {artifactId&&!ready&&!error&&<div className="preview-loading" role="status"><Reel /><span>Loading your video preview…</span></div>}
     {error&&<p className="error">{error}</p>}
   </div><div className="transport"><button title={s.playing?"Pause":"Play"} disabled={!artifactId||!ready} onClick={()=>s.play(!s.playing)}>{s.playing?<Pause size={18}/>:<Play size={18}/>}</button>
     <span className="timecode">{s.time.toFixed(2).padStart(5,"0")} <em>/ {s.timeline.duration_seconds.toFixed(2)}</em></span><input aria-label="Scrub preview" type="range" min={0} max={s.timeline.duration_seconds} step={1/24} value={s.time} onChange={e=>{s.play(false);s.seek(Number(e.target.value));}}/>

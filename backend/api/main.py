@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import re
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import Field
 from vibeshorts_mcp.server import build_server, http_app
 
-from execution.dispatch import Dispatcher, PubSubPublisher, Reconciler
+from execution.dispatch import Dispatcher, PubSubPublisher, Reconciler, handle
 from execution.runtime import Runtime
 from execution.telemetry import metrics
 from tools.contracts.errors import AppError
@@ -58,6 +59,32 @@ class BodyLimit:
             )
 
 
+class FlushOutbox:
+    """Publish a project's new outbox rows before answering a successful mutation of it.
+
+    Without this, accepted work waits for the scheduled dispatch, which still runs as the fallback.
+    """
+
+    def __init__(self, app, commands):
+        self.app, self.commands = app, commands
+
+    async def __call__(self, scope, receive, send):
+        match = (
+            re.match(r"^/v1/projects/([A-Za-z0-9_-]+)(?:/|$)", scope["path"])
+            if scope["type"] == "http" and scope["method"] != "GET"
+            else None
+        )
+        if not match or self.commands.publisher is None:
+            return await self.app(scope, receive, send)
+
+        async def flushing_send(message):
+            if message["type"] == "http.response.start" and message["status"] < 400:
+                await asyncio.to_thread(self.commands.flush, match[1])
+            await send(message)
+
+        await self.app(scope, receive, flushing_send)
+
+
 def create_app(runtime=None):
     runtime = runtime or Runtime.create()
     commands, broker = runtime.commands, runtime.oauth
@@ -72,12 +99,13 @@ def create_app(runtime=None):
 
     app = FastAPI(title="VibeShorts", version="0.1.0", lifespan=lifespan)
     app.state.runtime = runtime
+    app.add_middleware(FlushOutbox, commands=commands)
     app.add_middleware(BodyLimit)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.web_url],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
         expose_headers=["WWW-Authenticate", "MCP-Session-Id", "MCP-Protocol-Version"],
     )
@@ -239,6 +267,10 @@ def create_app(runtime=None):
     def create_project(body: ProjectCreate, caller: Caller = Depends(firebase_caller)):
         return commands.create_project(caller, body)
 
+    @app.delete("/v1/projects/{project_id}")
+    def delete_project(project_id: str, caller: Caller = Depends(firebase_caller)):
+        return commands.delete_project(caller, project_id)
+
     @app.post("/v1/projects/{project_id}/brand")
     def update_brand(project_id: str, body: BrandUpdate, caller: Caller = Depends(firebase_caller)):
         return commands.update_brand(caller, project_id, body)
@@ -320,10 +352,13 @@ def create_app(runtime=None):
     def execute(body: dict):
         try:
             message = json.loads(base64.b64decode(body["message"]["data"], validate=True))
-            project_id, job_id = message["project_id"], message["job_id"]
-        except (KeyError, ValueError, TypeError) as exc:
+            required = ("target", "target_id") if message.get("kind") == "advance" else ("job_id",)
+            if not all(isinstance(message[key], str) for key in ("project_id", *required)):
+                raise ValueError("Queue fields must be strings")
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
             raise AppError("INVALID_INPUT", "Malformed queue envelope", 422) from exc
-        runtime.worker.execute(project_id, job_id)
+        # A busy scheduler raises 409, so Pub/Sub redelivers the message with backoff.
+        handle(commands, runtime.worker, message)
         return {"acknowledged": True}
 
     @app.post("/internal/dispatch", dependencies=[Depends(internal_caller)])

@@ -200,6 +200,15 @@
 .scene-card > .chat-button {
   margin-top: 12px;
 }
+.scene-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+.scene-card-actions .delete-button {
+  width: 36px;
+  min-height: 36px;
+}
 .scene-card-media {
   position: relative;
   aspect-ratio: 9/16;

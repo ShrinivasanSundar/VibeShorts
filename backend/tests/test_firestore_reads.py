@@ -22,7 +22,7 @@ def test_studio_reuses_loaded_jobs_and_limits_history(runtime, alice, bob, proje
     state = runtime.commands.studio_state(alice, project).data
     assert len(state["jobs"]) == 60
     assert len(state["runs"]) == 20
-    assert len(state["events"]) <= 60
+    assert "assets" not in state and "events" not in state
     assert not any("/jobs/" in path or "/runs/" in path for path in reads)
     assert all("caller" not in (run["workflow"] or {}) for run in state["runs"])
     with pytest.raises(AppError):

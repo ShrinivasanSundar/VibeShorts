@@ -14,6 +14,7 @@ import {
 import { emptyTimeline } from "../lib/studio-types";
 import type { Conversation } from "../lib/studio-types";
 import { ChatWorkspace } from "./chat-workspace";
+import { LoadingState } from "./loading-state";
 
 export function ProjectWorkspace({
   projectId,
@@ -28,7 +29,7 @@ export function ProjectWorkspace({
   const cancelTransition = useRef<(() => void) | null>(null);
   const [linkError, setLinkError] = useState("");
   const queryClient = useQueryClient();
-  const { data, error } = useQuery({
+  const { data, error, isPending } = useQuery({
     queryKey: ["conversations", user.uid, projectId, "list"],
     queryFn: async () =>
       (await call(`${projectRoot(projectId)}/conversations`)).data as {
@@ -104,9 +105,10 @@ export function ProjectWorkspace({
   }
   if (!ready)
     return (
-      <p className="workspace-loading" role="status">
-        Opening your workspace…
-      </p>
+      <LoadingState
+        className="workspace-loading centered"
+        label="Opening your workspace…"
+      />
     );
   const history = [...(data?.conversations || []), ...extra].filter(
     (c, i, a) => a.findIndex((x) => x.id === c.id) === i,
@@ -120,6 +122,7 @@ export function ProjectWorkspace({
       {linkError && <p role="alert">{linkError}</p>}
       <ChatWorkspace
         conversations={history}
+        historyLoading={isPending}
         historyError={error?.message}
         conversationId={conversationId}
         onSelect={select}
@@ -148,6 +151,22 @@ export function ProjectWorkspace({
         onOpenComposition={async (id) => {
           if (!(await canSwitch())) return;
           await create(undefined, "bulk", "Existing cut", id);
+        }}
+        onDelete={async (id) => {
+          await call(`${projectRoot(projectId)}/conversations/${id}`, {
+            method: "DELETE",
+          });
+          if (id === conversationId) {
+            useStudio.getState().reset();
+            setConversationId(null);
+          }
+          setExtra((v) => v.filter((c) => c.id !== id));
+          queryClient.removeQueries({
+            queryKey: ["conversations", user.uid, projectId, id],
+          });
+          await queryClient.invalidateQueries({
+            queryKey: ["conversations", user.uid, projectId],
+          });
         }}
         hasMore={!!(cursor === undefined ? data?.next_cursor : cursor)}
         onMore={async () => {

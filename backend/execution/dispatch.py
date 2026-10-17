@@ -6,6 +6,15 @@ from tools.commands import project_path
 from tools.contracts.errors import AppError
 
 
+def live_matches(repo, group, field, values):
+    """(project_id, document) pairs from one collection-group query, skipping deleting projects."""
+    matches = [(path.split("/")[1], doc) for path, doc in repo.group_where(group, field, values)]
+    ids = list(dict.fromkeys(pid for pid, _ in matches))
+    projects = repo.get_many([project_path(i) for i in ids])
+    live = {pid for pid, p in zip(ids, projects, strict=True) if p and not p.get("deleting")}
+    return [(pid, doc) for pid, doc in matches if pid in live]
+
+
 class PubSubPublisher:
     def __init__(self, settings):
         from google.cloud import pubsub_v1
@@ -21,53 +30,94 @@ class Dispatcher:
     def __init__(self, commands, publisher):
         self.commands, self.publisher = commands, publisher
 
-    def dispatch(self):
+    def dispatch(self, project_id=None):
+        """Publish due outbox rows: every project's, or one project's after it committed new work."""
+        repo = self.commands.repo
+        if project_id is None:
+            items = live_matches(repo, "outbox", "status", ["pending"])
+        else:
+            project = repo.get(project_path(project_id))
+            if not project or project.get("deleting"):
+                return 0
+            pending = repo.list_where(project_path(project_id, "outbox"), "status", ["pending"])
+            items = [(project_id, item) for item in pending]
         sent = 0
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
+        for project_id, item in items:
+            if item["status"] != "pending" or item["next_attempt_at"] > self.commands.clock():
                 continue
-            project_id = project["project_id"]
-            for item in self.commands.repo.list_where(
-                project_path(project_id, "outbox"), "status", ["pending"]
-            ):
-                if item["status"] != "pending" or item["next_attempt_at"] > self.commands.clock():
-                    continue
-                try:
-                    self.publisher.publish({"project_id": project_id, "job_id": item["job_id"]})
+            fields = (
+                {"kind": "advance", "target": item["target"], "target_id": item["target_id"]}
+                if item.get("kind") == "advance"
+                else {"job_id": item["job_id"]}
+            )
+            try:
+                self.publisher.publish({"project_id": project_id, **fields})
 
-                    def mark(tx, project_id=project_id, item=item):
-                        path = project_path(project_id, "outbox", item["id"])
-                        current = tx.get(path)
-                        if (
-                            current
-                            and current["status"] == "pending"
-                            and current["next_attempt_at"] == item["next_attempt_at"]
-                        ):
-                            current["status"] = "sent"
-                            tx.set(path, current)
+                def mark(tx, project_id=project_id, item=item):
+                    path = project_path(project_id, "outbox", item["id"])
+                    current = tx.get(path)
+                    if (
+                        current
+                        and current["status"] == "pending"
+                        and current["next_attempt_at"] == item["next_attempt_at"]
+                        and current.get("nonce") == item.get("nonce")
+                    ):
+                        current["status"] = "sent"
+                        tx.set(path, current)
 
-                    self.commands.repo.atomic(mark)
-                    sent += 1
-                    event(
-                        "outbox_sent",
-                        job_id=item["job_id"],
-                        queue_age_seconds=self.commands.clock() - item["created_at"],
-                    )
-                except Exception:
+                self.commands.repo.atomic(mark)
+                sent += 1
+                event(
+                    "outbox_sent",
+                    **fields,
+                    queue_age_seconds=self.commands.clock() - item["created_at"],
+                )
+            except Exception:
 
-                    def retry(tx, project_id=project_id, item=item):
-                        path = project_path(project_id, "outbox", item["id"])
-                        current = tx.get(path)
-                        if current and current["status"] == "pending":
-                            current["attempts"] += 1
-                            current["next_attempt_at"] = self.commands.clock() + min(
-                                60, 2 ** min(current["attempts"], 6)
-                            )
-                            tx.set(path, current)
+                def retry(tx, project_id=project_id, item=item):
+                    path = project_path(project_id, "outbox", item["id"])
+                    current = tx.get(path)
+                    if current and current["status"] == "pending":
+                        current["attempts"] += 1
+                        current["next_attempt_at"] = self.commands.clock() + min(
+                            60, 2 ** min(current["attempts"], 6)
+                        )
+                        tx.set(path, current)
 
-                    self.commands.repo.atomic(retry)
-                    event("outbox_failure", job_id=item["job_id"])
+                self.commands.repo.atomic(retry)
+                event("outbox_failure", **fields)
         return sent
+
+
+def advance(commands, project_id, target, target_id):
+    """One scheduler pass for a run or conversation. False means another pass holds its lease."""
+    from execution.workflow import WorkflowScheduler
+    from tools.conversations import ConversationScheduler, conversation_path
+
+    project = commands.repo.get(project_path(project_id))
+    if not project or project.get("deleting"):
+        return True
+    if target == "run":
+        run = commands.repo.get(project_path(project_id, "runs", target_id))
+        return WorkflowScheduler(commands).resume(project_id, run) if run else True
+    doc = commands.repo.get(conversation_path(project_id, target_id))
+    if not doc or doc.get("deleting"):
+        return True
+    return ConversationScheduler(commands).resume(project_id, doc)
+
+
+def handle(commands, worker, message):
+    """Process one queue message, then publish the work it enqueued without waiting for a sweep."""
+    project_id = message["project_id"]
+    try:
+        if message.get("kind") == "advance":
+            if not advance(commands, project_id, message["target"], message["target_id"]):
+                # Another pass may have read state before this change; redelivery runs a fresh pass.
+                raise AppError("SCHEDULER_BUSY", "Another scheduler pass is in progress", 409, retryable=True)
+        else:
+            worker.execute(project_id, message["job_id"])
+    finally:
+        commands.flush(project_id)
 
 
 class Reconciler:
@@ -79,98 +129,45 @@ class Reconciler:
 
         WorkflowScheduler(self.commands).sweep()
         recovered = 0
-        for project in self.commands.repo.list("projects"):
-            if not project.get("project_id"):
+        statuses = [
+            "queued",
+            "claimed",
+            "submitting",
+            "waiting_for_provider",
+            "cancel_requested",
+            "submission_unknown",
+            "materializing",
+        ]
+        for project_id, job in live_matches(self.commands.repo, "jobs", "status", statuses):
+            if job["status"] in {"succeeded", "failed", "cancelled"}:
                 continue
-            project_id = project["project_id"]
-            for job in self.commands.repo.list_where(
-                project_path(project_id, "jobs"),
-                "status",
-                [
-                    "queued",
-                    "claimed",
-                    "submitting",
-                    "waiting_for_provider",
-                    "cancel_requested",
-                    "submission_unknown",
-                    "materializing",
-                ],
-            ):
-                if job["status"] in {"succeeded", "failed", "cancelled"}:
-                    continue
-                if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
-                    continue
-                candidate = (
-                    self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
-                )
-                from execution.director_recovery import recover_director_failure
+            if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
+                continue
+            candidate = self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
+            from execution.director_recovery import recover_director_failure
 
-                if not candidate and recover_director_failure(self.commands, job):
-                    recovered += 1
-                    continue
+            if not candidate and recover_director_failure(self.commands, job):
+                recovered += 1
+                continue
 
-                def apply(tx, project_id=project_id, job=job, candidate=candidate):
-                    current = tx.get(project_path(project_id, "jobs", job["job_id"]))
-                    if (
-                        current["status"] in {"succeeded", "failed", "cancelled"}
-                        or current["lease_expires_at"] > self.commands.clock()
-                    ):
-                        return False
-                    current["lease_owner"], current["lease_expires_at"] = None, 0
-                    if current.get("provider_operation") and not candidate:
-                        self.commands.transition(tx, current, "waiting_for_provider")
-                        current["next_poll_at"] = self.commands.clock()
-                        tx.set(project_path(project_id, "jobs", current["job_id"]), current)
-                        tx.set(
-                            project_path(project_id, "outbox", current["job_id"]),
-                            {
-                                "id": current["job_id"],
-                                "job_id": current["job_id"],
-                                "project_id": project_id,
-                                "status": "pending",
-                                "next_attempt_at": self.commands.clock(),
-                                "attempts": 0,
-                                "created_at": self.commands.clock(),
-                            },
-                        )
-                        return True
-                    if current["status"] in {
-                        "submitting",
-                        "cancel_requested",
-                        "submission_unknown",
-                        "materializing",
-                    }:
-                        if (
-                            candidate
-                            and candidate[1].get("input_hash") == current["input_hash"]
-                            and candidate[1].get("attempt") == current["attempt"]
-                            and current["candidate_path"] == job["candidate_path"]
-                        ):
-                            self.commands.transition(tx, current, "materializing")
-                        else:
-                            if current["status"] == "submission_unknown":
-                                return False
-                            current["costs"]["uncertain"] = True
-                            entry_path = "budgets/" + project_id + "/entries/" + job["job_id"]
-                            entry = tx.get(entry_path)
-                            entry.update(status="uncertain", uncertain=True)
-                            tx.set(entry_path, entry)
-                            current["error"] = AppError(
-                                "PROVIDER_SUBMISSION_UNCERTAIN",
-                                "The provider may have accepted this request",
-                                action="reconcile",
-                                job_id=job["job_id"],
-                            ).payload.model_dump()
-                            self.commands.transition(tx, current, "submission_unknown")
-                            event("uncertain_submission", job_id=job["job_id"])
-                            return True
-                    else:
-                        self.commands.transition(tx, current, "queued")
+            def apply(tx, project_id=project_id, job=job, candidate=candidate):
+                current = tx.get(project_path(project_id, "jobs", job["job_id"]))
+                if (
+                    not current
+                    or current["status"] in {"succeeded", "failed", "cancelled"}
+                    or current["lease_expires_at"] > self.commands.clock()
+                ):
+                    return False
+                current["lease_owner"], current["lease_expires_at"] = None, 0
+                if current.get("provider_operation") and not candidate:
+                    self.commands.transition(tx, current, "waiting_for_provider")
+                    current["next_poll_at"] = self.commands.clock()
+                    tx.set(project_path(project_id, "jobs", current["job_id"]), current)
                     tx.set(
-                        project_path(project_id, "outbox", job["job_id"]),
+                        project_path(project_id, "outbox", current["job_id"]),
                         {
-                            "id": job["job_id"],
-                            "job_id": job["job_id"],
+                            "id": current["job_id"],
+                            "job_id": current["job_id"],
                             "project_id": project_id,
                             "status": "pending",
                             "next_attempt_at": self.commands.clock(),
@@ -178,10 +175,55 @@ class Reconciler:
                             "created_at": self.commands.clock(),
                         },
                     )
-                    event("lease_recovered", job_id=job["job_id"])
                     return True
+                if current["status"] in {
+                    "submitting",
+                    "cancel_requested",
+                    "submission_unknown",
+                    "materializing",
+                }:
+                    if (
+                        candidate
+                        and candidate[1].get("input_hash") == current["input_hash"]
+                        and candidate[1].get("attempt") == current["attempt"]
+                        and current["candidate_path"] == job["candidate_path"]
+                    ):
+                        self.commands.transition(tx, current, "materializing")
+                    else:
+                        if current["status"] == "submission_unknown":
+                            return False
+                        current["costs"]["uncertain"] = True
+                        entry_path = "budgets/" + project_id + "/entries/" + job["job_id"]
+                        entry = tx.get(entry_path)
+                        entry.update(status="uncertain", uncertain=True)
+                        tx.set(entry_path, entry)
+                        current["error"] = AppError(
+                            "PROVIDER_SUBMISSION_UNCERTAIN",
+                            "The provider may have accepted this request",
+                            action="reconcile",
+                            job_id=job["job_id"],
+                        ).payload.model_dump()
+                        self.commands.transition(tx, current, "submission_unknown")
+                        event("uncertain_submission", job_id=job["job_id"])
+                        return True
+                else:
+                    self.commands.transition(tx, current, "queued")
+                tx.set(
+                    project_path(project_id, "outbox", job["job_id"]),
+                    {
+                        "id": job["job_id"],
+                        "job_id": job["job_id"],
+                        "project_id": project_id,
+                        "status": "pending",
+                        "next_attempt_at": self.commands.clock(),
+                        "attempts": 0,
+                        "created_at": self.commands.clock(),
+                    },
+                )
+                event("lease_recovered", job_id=job["job_id"])
+                return True
 
-                recovered += int(self.commands.repo.atomic(apply))
+            recovered += int(self.commands.repo.atomic(apply))
         return recovered
 
 
@@ -193,6 +235,7 @@ class EmulatorPump:
 
         self.commands, self.worker = commands, worker
         self.publisher = PubSubPublisher(commands.settings)
+        commands.publisher = self.publisher
         self.subscriber = pubsub_v1.SubscriberClient()
         self.subscription = self.subscriber.subscription_path(
             commands.settings.google_cloud_project,
@@ -215,14 +258,15 @@ class EmulatorPump:
         except AlreadyExists:
             pass
 
-    def once(self, *, sweep_workflows=True):
+    def once(self, *, sweep_workflows=True, dispatch=True):
         from execution.workflow import WorkflowScheduler
 
         if sweep_workflows:
             WorkflowScheduler(self.commands).sweep()
         from google.api_core.exceptions import DeadlineExceeded
 
-        self.dispatcher.dispatch()
+        if dispatch:
+            self.dispatcher.dispatch()
         try:
             response = self.subscriber.pull(
                 request={"subscription": self.subscription, "max_messages": 10}, timeout=2
@@ -230,15 +274,23 @@ class EmulatorPump:
         except DeadlineExceeded:
             return
         for message in response.received_messages:
-            body = json.loads(message.message.data)
-            self.worker.execute(body["project_id"], body["job_id"])
+            try:
+                handle(self.commands, self.worker, json.loads(message.message.data))
+            except AppError as exc:
+                if exc.payload.code != "SCHEDULER_BUSY":
+                    raise
+                continue  # Unacknowledged: redelivered after the subscription's ack deadline.
             self.subscriber.acknowledge(
                 request={"subscription": self.subscription, "ack_ids": [message.ack_id]}
             )
 
     def run(self):
         self.bootstrap()
-        next_sweep = 0
+        next_sweep = next_scan = 0
+        # Handled messages publish their follow-up work, so the Firestore scans are a fallback
+        # at the configured rate while Pub/Sub pulls continue between them.
+        settings = self.commands.settings
+        interval = settings.local_live_poll_seconds if settings.local_live else 0.25
         while True:
             from google.api_core.exceptions import ResourceExhausted
 
@@ -250,16 +302,17 @@ class EmulatorPump:
                     next_sweep = time.time() + 60
                     reconciled = True
                 operation = "dispatch_and_execute"
-                self.once(sweep_workflows=not reconciled)
+                scan = time.time() >= next_scan
+                if scan:
+                    next_scan = time.time() + interval
+                # Locally against live Firestore, the minute reconcile already sweeps workflows.
+                sweep_workflows = scan and not reconciled and not settings.local_live
+                self.once(sweep_workflows=sweep_workflows, dispatch=scan)
             except ResourceExhausted as exc:
                 event("worker_quota_exhausted", operation=operation, error=str(exc), retry_after_seconds=60)
                 time.sleep(60)
                 continue
-            time.sleep(
-                self.commands.settings.local_live_poll_seconds
-                if self.commands.settings.local_live
-                else 0.25
-            )
+            time.sleep(0.25)
 
 
 def reconcile_decision(commands, project_id, job_id, amount_micros, evidence, operator):

@@ -64,6 +64,7 @@ export type Run = {
   status: string;
   version: number;
   pending_approval_id: string | null;
+  error?: { code?: string; message: string } | null;
   workflow?: {
     brief: { brief: string };
     stage: string;
@@ -97,10 +98,8 @@ export type StudioState = {
   };
   runs: Run[];
   jobs: Job[];
-  assets: { assets: Asset[]; next_cursor: string | null };
   approvals: Approval[];
   brand: Brand | null;
-  events: { sequence: number; status: string; created_at: number }[];
 };
 export const emptyTimeline: Timeline = {
   fonts: {},
@@ -168,6 +167,10 @@ export type ChatMessage = {
   job_id?: string;
 };
 export type ConversationState = {
+  /** Conversation revision these messages are current to; send back as `since`. */
+  revision?: number;
+  /** True when `messages` holds only messages written after `since`. */
+  incremental?: boolean;
   production?: ProductionSummary;
   conversation: Conversation;
   messages: ChatMessage[];
@@ -192,6 +195,8 @@ export type ProductionStep = {
   status: string;
   artifact_id: string | null;
   error?: { message: string } | null;
+  created_at?: number | null;
+  updated_at?: number | null;
 };
 export type ProductionSummary = {
   mode: "bulk" | "guided";

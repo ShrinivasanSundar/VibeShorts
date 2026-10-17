@@ -59,6 +59,10 @@ class MemoryStorage:
     def uri(self, path: str):
         return "memory://" + path
 
+    def delete_prefix(self, prefix: str):
+        for path in [p for p in self.objects if p.startswith(prefix)]:
+            del self.objects[path]
+
 
 class CloudStorage:
     def __init__(self, settings):
@@ -95,6 +99,15 @@ class CloudStorage:
 
     def uri(self, path: str):
         return f"gs://{self.settings.bucket}/{path}"
+
+    def delete_prefix(self, prefix: str):
+        from google.api_core.exceptions import NotFound
+
+        for blob in self.client.list_blobs(self.bucket, prefix=prefix):
+            try:
+                blob.delete()
+            except NotFound:
+                pass
 
     def signed_url(self, path: str, method="GET", mime_type=None):
         import google.auth

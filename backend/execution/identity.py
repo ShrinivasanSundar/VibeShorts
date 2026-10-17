@@ -3,6 +3,9 @@ import time
 from tools.contracts.errors import AppError
 from tools.contracts.models import Caller
 
+# Firebase user lookups are cached briefly; users.access_enabled stays the instant kill switch.
+USER_CHECK_TTL_SECONDS = 30.0
+
 
 class FirebaseIdentity:
     def __init__(self, settings):
@@ -15,12 +18,14 @@ class FirebaseIdentity:
                 options={"projectId": settings.google_cloud_project},
                 name=settings.google_cloud_project,
             )
+        self.users: dict[str, tuple[float, bool, float]] = {}
 
     def verify(self, token: str) -> Caller:
         from firebase_admin import auth
 
         try:
-            claims = auth.verify_id_token(token, app=self.app, check_revoked=True)
+            # check_uid performs the disabled/revocation check with a cached user lookup.
+            claims = auth.verify_id_token(token, app=self.app)
             if claims.get("firebase", {}).get("sign_in_provider") == "anonymous":
                 raise ValueError("Anonymous sign-in is disabled")
             caller = Caller(uid=claims["uid"], auth_time=claims["auth_time"])
@@ -33,8 +38,15 @@ class FirebaseIdentity:
         from firebase_admin import auth
 
         try:
-            user = auth.get_user(uid, app=self.app)
-            if user.disabled or user.tokens_valid_after_timestamp / 1000 > auth_time:
+            cached = self.users.get(uid)
+            if not cached or time.monotonic() - cached[0] > USER_CHECK_TTL_SECONDS:
+                user = auth.get_user(uid, app=self.app)
+                cached = (time.monotonic(), user.disabled, user.tokens_valid_after_timestamp / 1000)
+                if len(self.users) > 10_000:
+                    self.users.clear()
+                self.users[uid] = cached
+            _, disabled, valid_after = cached
+            if disabled or valid_after > auth_time:
                 raise ValueError("User credentials revoked")
         except Exception as exc:
             raise AppError("ACCESS_DENIED", "User access is disabled or revoked", 403) from exc
@@ -43,6 +55,7 @@ class FirebaseIdentity:
         from firebase_admin import auth
 
         auth.revoke_refresh_tokens(uid, app=self.app)
+        self.users.pop(uid, None)
 
 
 class TestIdentity:

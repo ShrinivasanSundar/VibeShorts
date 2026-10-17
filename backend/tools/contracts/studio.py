@@ -229,8 +229,9 @@ class ConversationMessage(Mutation):
 
 
 class ConversationAction(Mutation):
-    action: Literal["approve", "continue", "revise", "retry", "cancel"]
+    action: Literal["approve", "continue", "revise", "retry", "cancel", "remove_scene"]
     job_id: str | None = None
+    scene_id: str | None = Field(default=None, min_length=1, max_length=100)
     approval_id: str | None = None
     target_artifact_id: str | None = None
     instruction: str | None = Field(default=None, min_length=1, max_length=2000)

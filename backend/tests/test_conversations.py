@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import create_app
-from execution.dispatch import Reconciler
+from execution.dispatch import Dispatcher, Reconciler, handle
 from execution.runtime import Runtime
 from execution.workflow import WorkflowScheduler
 from providers.image import ImageOutput
@@ -19,6 +19,7 @@ from tools.contracts.studio import (
     ConversationMessage,
     StudioCommand,
 )
+from tools.conversations import ConversationScheduler
 
 
 @pytest.fixture
@@ -48,6 +49,12 @@ def tick(runtime, project, times=1):
         for job in runtime.commands.repo.list(project_path(project, "jobs")):
             if job["status"] == "queued":
                 restarted.worker.execute(project, job["job_id"])
+        # The scheduled dispatch also delivers committed advance events, as Pub/Sub would.
+        queue = Queue()
+        Dispatcher(restarted.commands, queue).dispatch(project)
+        for message in queue.messages:
+            if message.get("kind") == "advance":
+                handle(restarted.commands, restarted.worker, message)
 
 
 def state(runtime, alice, project, chat):
@@ -191,6 +198,26 @@ def test_message_idempotency_pagination_and_access(runtime, alice, bob, project,
     assert page["next_cursor"]
     next_page = runtime.commands.conversation_state(alice, project, chat, cursor=page["next_cursor"]).data
     assert all(m["sequence"] > page["messages"][0]["sequence"] for m in next_page["messages"])
+
+
+def test_incremental_reads_return_new_and_changed_messages(runtime, alice, project, chat):
+    runtime.commands.send_message(
+        alice, project, chat, ConversationMessage(idempotency_key="first", text="Just write a storyboard")
+    )
+    before = runtime.commands.conversation_state(alice, project, chat, tail=True).data
+    assert not before["incremental"] and before["revision"] == 1
+    unchanged = runtime.commands.conversation_state(alice, project, chat, tail=True, since=1).data
+    assert unchanged["incremental"] and unchanged["messages"] == []
+    tick(runtime, project, 5)
+    after = runtime.commands.conversation_state(alice, project, chat, tail=True, since=1).data
+    assert after["incremental"] and after["revision"] > 1
+    by_id = {m["id"]: m for m in after["messages"]}
+    # The user's request changed status, and the director's reply is new.
+    assert by_id[before["messages"][0]["id"]]["status"] == "succeeded"
+    assert any(m["role"] == "assistant" for m in after["messages"])
+    assert all(m["revision"] > 1 for m in after["messages"])
+    capped = runtime.commands.conversation_state(alice, project, chat, tail=True, since=0, limit=1).data
+    assert not capped["incremental"] and len(capped["messages"]) == 1
 
 
 def test_stop_cancels_queued_requests(runtime, alice, project, chat):
@@ -671,3 +698,131 @@ def test_storyboard_cannot_be_approved_while_requested_changes_are_pending(runti
     with pytest.raises(AppError, match="Wait for your requested changes"):
         approve(runtime, alice, project, first["run"]["approval"])
     assert not any(j["kind"] == "video" for j in runtime.commands.repo.list(project_path(project, "jobs")))
+
+
+def test_run_level_failure_keeps_submitted_children_and_can_resume(runtime, alice, project, chat, monkeypatch):
+    current = start(runtime, alice, project, chat)
+    approve(runtime, alice, project, current["run"]["approval"])
+    commands = type(runtime.commands)
+    original = commands.submit_job
+
+    def over_budget(self, caller, request, kind, *args, **kwargs):
+        if kind == "image":
+            raise AppError("BUDGET_EXHAUSTED", "Available budget is below the reservation", 409)
+        return original(self, caller, request, kind, *args, **kwargs)
+
+    monkeypatch.setattr(commands, "submit_job", over_budget)
+    tick(runtime, project)
+    failed = state(runtime, alice, project, chat)
+    assert failed["run"]["status"] == "failed"
+    assert failed["run"]["error"]["code"] == "BUDGET_EXHAUSTED"
+    # Music was submitted earlier in the failing pass and must stay linked to the run.
+    music = failed["run"]["workflow"]["children"]["music"]
+    monkeypatch.setattr(commands, "submit_job", original)
+    body = ConversationAction(idempotency_key="resume", action="retry")
+    assert runtime.commands.conversation_action(alice, project, chat, body).data["status"] == "waiting_for_jobs"
+    tick(runtime, project, 2)
+    resumed = state(runtime, alice, project, chat)["run"]
+    assert resumed["error"] is None
+    assert resumed["workflow"]["children"]["music"] == music
+    assert "scene-1:keyframe" in resumed["workflow"]["children"]
+
+
+def test_slow_workflow_pass_still_links_children(runtime, alice, project, chat, monkeypatch):
+    current = start(runtime, alice, project, chat)
+    approve(runtime, alice, project, current["run"]["approval"])
+    commands = type(runtime.commands)
+    original = commands.submit_job
+
+    def slow(self, *args, **kwargs):
+        # A transcontinental Firestore link makes each submission take seconds.
+        runtime.commands.clock.advance(45)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(commands, "submit_job", slow)
+    tick(runtime, project)
+    run = state(runtime, alice, project, chat)["run"]
+    assert run["workflow"]["stage"] == "production"
+    assert {"music", "scene-1:keyframe"} <= set(run["workflow"]["children"])
+
+
+class Queue:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message)
+
+
+def drain(runtime, queue, limit=400):
+    """Deliver published messages in order until none remain, as Pub/Sub push would."""
+    restarted = Runtime(runtime.commands)
+    for _ in range(limit):
+        if not queue.messages:
+            return
+        handle(restarted.commands, restarted.worker, queue.messages.pop(0))
+    pytest.fail("Advance messages did not settle")
+
+
+def test_events_alone_drive_a_video_to_export(runtime, alice, project, chat, monkeypatch):
+    def no_sweep(self):
+        raise AssertionError("The periodic sweep is only a recovery fallback")
+
+    monkeypatch.setattr(WorkflowScheduler, "sweep", no_sweep)
+    monkeypatch.setattr(ConversationScheduler, "sweep", no_sweep)
+    queue = Queue()
+    runtime.commands.publisher = queue
+    runtime.commands.send_message(
+        alice,
+        project,
+        chat,
+        ConversationMessage(idempotency_key="idea", text="A 6 second robot story", duration_seconds=6),
+    )
+    runtime.commands.flush(project)  # The API flushes after each successful project mutation.
+    gates = []
+    for _ in range(20):
+        drain(runtime, queue)
+        current = state(runtime, alice, project, chat)
+        if current["run"]["status"] == "succeeded":
+            break
+        approval = current["run"]["approval"]
+        assert approval and approval["decision"] == "pending", current
+        gates.append(approval["kind"])
+        approve(runtime, alice, project, approval)
+        runtime.commands.flush(project)
+    else:
+        pytest.fail(str(current))
+    assert gates[0] == "storyboard" and gates[-1] == "preview" and "scene" in gates
+    assert any(b["kind"] == "export" for m in current["messages"] for b in m["blocks"])
+
+
+def test_busy_advance_is_redelivered_and_still_flushes(runtime, alice, project, chat):
+    current = start(runtime, alice, project, chat)
+    run_path = project_path(project, "runs", current["run"]["run_id"])
+    runtime.commands.repo.atomic(
+        lambda tx: tx.set(
+            run_path,
+            {
+                **tx.get(run_path),
+                "status": "waiting_for_jobs",
+                "scheduler_expiry": runtime.commands.clock() + 60,
+            },
+        )
+    )
+    queue = Queue()
+    runtime.commands.publisher = queue
+    runtime.commands.repo.atomic(
+        lambda tx: runtime.commands.enqueue_advance(tx, project, "conversation", chat)
+    )
+    message = {
+        "project_id": project,
+        "kind": "advance",
+        "target": "run",
+        "target_id": current["run"]["run_id"],
+    }
+    with pytest.raises(AppError) as exc:
+        handle(runtime.commands, runtime.worker, message)
+    assert exc.value.payload.code == "SCHEDULER_BUSY" and exc.value.status == 409
+    assert {"project_id": project, "kind": "advance", "target": "conversation", "target_id": chat} in (
+        queue.messages
+    )

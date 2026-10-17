@@ -51,6 +51,12 @@ def install(app, commands, caller_dependency):
     ):
         return commands.create_conversation(caller, project_id, body)
 
+    @app.delete("/v1/projects/{project_id}/conversations/{conversation_id}")
+    def delete_conversation(
+        project_id: str, conversation_id: str, caller: Caller = Depends(caller_dependency)
+    ):
+        return commands.delete_conversation(caller, project_id, conversation_id)
+
     @app.get("/v1/projects/{project_id}/conversations/{conversation_id}")
     def conversation(
         project_id: str,
@@ -58,9 +64,10 @@ def install(app, commands, caller_dependency):
         cursor: str | None = None,
         limit: int = Query(50, ge=1, le=100),
         tail: bool = False,
+        since: int | None = Query(None, ge=0),
         caller: Caller = Depends(caller_dependency),
     ):
-        return commands.conversation_state(caller, project_id, conversation_id, cursor, limit, tail)
+        return commands.conversation_state(caller, project_id, conversation_id, cursor, limit, tail, since)
 
     @app.post("/v1/projects/{project_id}/conversations/{conversation_id}/messages", status_code=202)
     def message(

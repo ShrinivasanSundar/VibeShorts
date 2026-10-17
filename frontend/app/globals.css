@@ -641,6 +641,9 @@ footer {
 
 .preview-loading {
   position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   font-size: 11px;
   color: var(--muted);
   background: #1b2027c9;
@@ -1555,6 +1558,39 @@ h1 span, .workspace-card > h2 span {
 .project-link:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+.project-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.project-row .project-link {
+  flex: 1;
+  min-width: 0;
+}
+
+.delete-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.delete-button:hover:not(:disabled),
+.delete-button:focus-visible {
+  color: #ffc0c9;
+  border-color: #6a3d49;
+  background: #41252d;
 }
 
 .project-link strong {
@@ -2703,4 +2739,73 @@ h1 span, .workspace-card > h2 span {
   .spin {
     animation-duration: 3s;
   }
+}
+
+.global-loader {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-soft);
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+  pointer-events: none;
+  transform: translate(-50%, 12px);
+  opacity: 0;
+  transition: opacity .2s, transform .2s;
+}
+
+.global-loader[data-visible="true"] {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.global-loader-reel {
+  width: 22px;
+  height: 22px;
+  color: var(--accent);
+  animation: global-loader-spin 1.1s linear infinite;
+}
+
+@keyframes global-loader-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .global-loader-reel { animation: global-loader-pulse 1.6s ease-in-out infinite; }
+  @keyframes global-loader-pulse { 50% { opacity: .4; } }
+}
+
+.loading-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 14px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.loading-reel {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+  animation: global-loader-spin 1.1s linear infinite;
+}
+
+.loading-state.centered {
+  justify-content: center;
+  padding: 40px 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-reel { animation: global-loader-pulse 1.6s ease-in-out infinite; }
 }

@@ -16,6 +16,8 @@ before(async () => {
     await setDoc(doc(db, "users/disabled"), { access_enabled: false });
     await setDoc(doc(db, "projects/rules-project"), { members: { alice: "owner", disabled: "viewer" } });
     await setDoc(doc(db, "projects/rules-project/run_summaries/run"), { status: "queued" });
+    await setDoc(doc(db, "projects/rules-project/conversations/chat"), { revision: 1 });
+    await setDoc(doc(db, "projects/rules-project/conversations/chat/messages/message"), { text: "private" });
   });
 });
 after(async () => { await env?.cleanup(); });
@@ -24,6 +26,15 @@ test("only enabled project members read summaries", async () => {
   await assertSucceeds(getDoc(doc(env.authenticatedContext("alice").firestore(), "projects/rules-project/run_summaries/run")));
   for (const context of [env.authenticatedContext("bob"), env.authenticatedContext("disabled"), env.unauthenticatedContext()]) {
     await assertFails(getDoc(doc(context.firestore(), "projects/rules-project/run_summaries/run")));
+  }
+});
+test("only enabled project members read a conversation, never its messages", async () => {
+  const alice = env.authenticatedContext("alice").firestore();
+  await assertSucceeds(getDoc(doc(alice, "projects/rules-project/conversations/chat")));
+  await assertFails(getDoc(doc(alice, "projects/rules-project/conversations/chat/messages/message")));
+  await assertFails(setDoc(doc(alice, "projects/rules-project/conversations/chat"), { revision: 2 }));
+  for (const context of [env.authenticatedContext("bob"), env.authenticatedContext("disabled"), env.unauthenticatedContext()]) {
+    await assertFails(getDoc(doc(context.firestore(), "projects/rules-project/conversations/chat")));
   }
 });
 test("browser cannot alter execution, budgets, grants or artifact records", async () => {

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Check,
   Download,
@@ -16,6 +17,7 @@ import { call, request } from "../lib/api";
 import { useStudio } from "../lib/studio-store";
 import type { Asset, Brand, Clip } from "../lib/studio-types";
 import { PrivateMedia } from "./private-media";
+import { LoadingState } from "./loading-state";
 
 const uid = () => crypto.randomUUID();
 const usd = (value: number) => `$${(value / 1e6).toFixed(3)}`;
@@ -72,6 +74,7 @@ export function WorkspaceTools({
   const w = useWorkspace();
   const {
     projectId,
+    user,
     base,
     data,
     busy,
@@ -128,7 +131,16 @@ export function WorkspaceTools({
     window.addEventListener("keydown", escape);
     return () => window.removeEventListener("keydown", escape);
   }, [onClose]);
-  const assets = [...(data?.assets.assets || []), ...moreAssets].filter(
+  // Fetched only while this drawer is open; the polled studio state no longer carries assets.
+  const assetPage = useQuery({
+    queryKey: ["assets", user.uid, projectId],
+    queryFn: async () =>
+      (await call(`${base}/assets?limit=100`)) as {
+        assets: Asset[];
+        next_cursor: string | null;
+      },
+  });
+  const assets = [...(assetPage.data?.assets || []), ...moreAssets].filter(
     (a, i, all) => all.findIndex((x) => x.id === a.id) === i,
   );
   function addClip(asset?: Asset) {
@@ -451,20 +463,24 @@ export function WorkspaceTools({
                     </div>
                   ))}
               </div>
-              {!assets.length && (
-                <p className="empty-note">
-                  A clean canvas. Import an image or create your first asset.
-                </p>
+              {!assetPage.data ? (
+                <LoadingState label="Loading your library…" />
+              ) : (
+                !assets.length && (
+                  <p className="empty-note">
+                    A clean canvas. Import an image or create your first asset.
+                  </p>
+                )
               )}
               {!assetsExhausted &&
-                (assetCursor || data?.assets.next_cursor) && (
+                (assetCursor || assetPage.data?.next_cursor) && (
                   <button
                     className="secondary full"
                     disabled={busy}
                     onClick={() =>
                       void action(async () => {
                         const response = await call(
-                          `${base}/assets?limit=100&cursor=${encodeURIComponent(assetCursor || data?.assets.next_cursor || "")}`,
+                          `${base}/assets?limit=100&cursor=${encodeURIComponent(assetCursor || assetPage.data?.next_cursor || "")}`,
                         );
                         setMoreAssets((v) => [...v, ...response.assets]);
                         setAssetCursor(response.next_cursor);
@@ -472,7 +488,7 @@ export function WorkspaceTools({
                       })
                     }
                   >
-                    Load more assets
+                    {busy ? "Loading more assets…" : "Load more assets"}
                   </button>
                 )}
             </>
@@ -755,7 +771,8 @@ export function WorkspaceTools({
                     </button>
                   </div>
                 ))}
-              {!assets.some((a) => a.type === "render") && (
+              {!data && <LoadingState label="Loading your exports…" />}
+              {data && !assets.some((a) => a.type === "render") && (
                 <p className="empty-note">
                   Your next export belongs here. Finish a composition and
                   approve its exact revision.

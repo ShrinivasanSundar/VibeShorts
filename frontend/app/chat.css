@@ -133,6 +133,21 @@
   flex-shrink: 0;
   color: var(--muted);
 }
+.chat-history-row {
+  display: flex;
+  gap: 4px;
+}
+.chat-history-row > button:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.chat-sidebar nav .delete-button {
+  width: 36px;
+  min-height: 0;
+  padding: 0;
+  justify-content: center;
+  border-color: transparent;
+}
 .chat-sidebar nav button.selected {
   background: var(--accent-soft);
   color: var(--accent);
@@ -382,8 +397,12 @@
 }
 .chat-media-loading {
   height: 200px;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-align: center;
   background: var(--bg-deep);
   color: var(--muted);
 }
@@ -725,6 +744,19 @@
 .chat-dialog .primary {
   background: var(--accent);
   color: var(--on-accent);
+}
+.chat-dialog .confirm-danger {
+  background: #41252d;
+  border-color: #6a3d49;
+  color: #ffc0c9;
+}
+.chat-dialog .confirm-danger:hover,
+.chat-dialog .confirm-danger:focus-visible {
+  background: #5a2f3a;
+}
+/* Above the projects sidebar, which is itself a modal. */
+.confirm-backdrop {
+  z-index: 900;
 }
 .workspace-loading {
   padding: 40px;

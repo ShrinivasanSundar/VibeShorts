@@ -11,6 +11,9 @@ service cloud.firestore {
       allow list, write: if false;
       match /run_summaries/{runId} { allow read: if projectReader(projectId); allow write: if false; }
       match /brands/{brandId} { allow read: if projectReader(projectId); allow write: if false; }
+      // Clients listen to a conversation's revision to refetch only when it changes.
+      // Its messages subcollection stays private (it holds caller and request details).
+      match /conversations/{conversationId} { allow get: if projectReader(projectId); allow list, write: if false; }
 
     }
     match /{document=**} { allow read, write: if false; }

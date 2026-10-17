@@ -1,4 +1,5 @@
 import { firebaseAuth } from "./firebase";
+import { track } from "./loading";
 
 const api = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
 
@@ -10,6 +11,11 @@ export class ApiError extends Error {
 }
 
 export async function request(path: string, options: RequestInit = {}) {
+  // Writes always show the loader; reads are polled in the background and stay silent.
+  return (options.method || "GET").toUpperCase() === "GET" ? send(path, options) : track(() => send(path, options));
+}
+
+async function send(path: string, options: RequestInit) {
   const current = firebaseAuth().currentUser;
   if (!current) throw new Error("Sign in to continue.");
   const response = await fetch(api + path, {

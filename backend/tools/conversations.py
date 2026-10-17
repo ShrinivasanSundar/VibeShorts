@@ -55,27 +55,43 @@ def append_message(commands, tx, project, conversation, source, role, text, bloc
     if not doc:
         raise AppError("NOT_FOUND", "Conversation not found", 404)
     sequence = doc.get("sequence", 0) + 1
+    revision = doc.get("revision", 0) + 1
     message = {
         "id": f"message_{sequence:012d}",
         "sequence": sequence,
+        "revision": revision,
         "role": role,
         "text": text,
         "blocks": blocks or [],
         "created_at": commands.clock(),
         **extra,
     }
-    doc.update(sequence=sequence, updated_at=commands.clock())
+    doc.update(sequence=sequence, revision=revision, updated_at=commands.clock())
     tx.set(path, doc)
     tx.set(path + "/messages/" + message["id"], message)
     tx.set(marker, {"id": message["id"]})
     return message
 
 
+def set_message(tx, path, message):
+    """Write a message and bump the conversation revision.
+
+    The revision lets clients listen to the conversation document and fetch only messages
+    written since the revision they already hold.
+    """
+    doc = tx.get(path)
+    if not doc:
+        return
+    doc["revision"] = doc.get("revision", 0) + 1
+    tx.set(path, doc)
+    tx.set(path + "/messages/" + message["id"], {**message, "revision": doc["revision"]})
+
+
 class ConversationCommands:
     def conversation(self, caller, project, conversation, tx=None, scope=None):
         self.authorize(caller, project, scope or "vibeshorts:read", tx)
         doc = (tx or self.repo).get(conversation_path(project, conversation))
-        if not doc:
+        if not doc or doc.get("deleting"):
             raise AppError("NOT_FOUND", "Conversation not found", 404)
         return doc
 
@@ -180,31 +196,40 @@ class ConversationCommands:
         from tools.commands import project_path
 
         self.authorize(caller, project)
-        docs = sorted(
-            self.repo.list(project_path(project, "conversations")),
-            key=lambda d: (d["updated_at"], d["id"]),
-            reverse=True,
-        )
-        if cursor:
-            index = next((i for i, d in enumerate(docs) if d["id"] == cursor), None)
-            docs = docs[index + 1 :] if index is not None else []
-        page = docs[:limit]
-        return DataResult(
-            data={"conversations": page, "next_cursor": page[-1]["id"] if len(docs) > limit else None}
-        )
-
-    def conversation_state(self, caller, project, conversation, cursor=None, limit=50, tail=False):
-        from tools.commands import project_path
-
-        doc = self.conversation(caller, project, conversation)
-        path = conversation_path(project, conversation)
-        messages = (self.repo.tail if tail else self.repo.page)(path + "/messages", limit + 1, cursor or "")
-        page = list(reversed(messages[:limit])) if tail else messages[:limit]
-        run = (
-            self.get_run(caller, project, doc["active_run_id"]).model_dump() if doc["active_run_id"] else None
-        )
+        docs = self.repo.latest(project_path(project, "conversations"), "updated_at", limit + 1, cursor or "")
+        more, docs = len(docs) > limit, docs[:limit]
         return DataResult(
             data={
+                "conversations": [d for d in docs if not d.get("deleting")],
+                "next_cursor": docs[-1]["id"] if more else None,
+            }
+        )
+
+    def conversation_state(
+        self, caller, project, conversation, cursor=None, limit=50, tail=False, since=None
+    ):
+        from tools.commands import project_path
+
+        # Read the conversation before its messages so the returned revision never runs ahead of them.
+        doc = self.conversation(caller, project, conversation)
+        path = conversation_path(project, conversation)
+        incremental = False
+        if since is not None and not cursor:
+            # Only messages written after the caller's revision; fall back to a full tail if too many.
+            changed = self.repo.above(path + "/messages", "revision", since, limit + 1)
+            if len(changed) <= limit:
+                incremental, messages = True, []
+                page = sorted(changed, key=lambda m: m["sequence"])
+        if not incremental:
+            messages = (self.repo.tail if tail else self.repo.page)(
+                path + "/messages", limit + 1, cursor or ""
+            )
+            page = list(reversed(messages[:limit])) if tail else messages[:limit]
+        run = self._load_run(project, doc["active_run_id"]).model_dump() if doc["active_run_id"] else None
+        return DataResult(
+            data={
+                "revision": doc.get("revision", 0),
+                "incremental": incremental,
                 "conversation": doc,
                 "production": self.production_summary(caller, project, doc, run),
                 "messages": [{k: v for k, v in m.items() if k not in {"caller", "request"}} for m in page],
@@ -218,13 +243,9 @@ class ConversationCommands:
                         "error": j.get("error"),
                         "retried_by": j.get("retried_by"),
                     }
-                    for j in sorted(
-                        self.repo.list_where(
-                            project_path(project, "jobs"), "conversation_id", [conversation]
-                        ),
-                        key=lambda j: j["created_at"],
-                        reverse=True,
-                    )[:15]
+                    for j in self.repo.recent_where(
+                        project_path(project, "jobs"), "conversation_id", conversation, 15
+                    )
                 ],
                 "next_cursor": messages[limit - 1]["id"] if len(messages) > limit else None,
             }
@@ -235,15 +256,20 @@ class ConversationCommands:
         from tools.commands import project_path
 
         flow = (run or {}).get("workflow") or {}
-        story = (
-            self.get_storyboard(caller, project, doc["storyboard_head"]).data
-            if doc["storyboard_head"]
-            else None
+        story = self._storyboard(caller, project, doc["storyboard_head"]) if doc["storyboard_head"] else None
+        children = flow.get("children", {})
+        # Every child job is read in one batched round trip rather than one read per step.
+        loaded = dict(
+            zip(
+                children.values(),
+                self.repo.get_many([project_path(project, "jobs", jid) for jid in children.values()]),
+                strict=True,
+            )
         )
 
         def step(key):
-            jid = flow.get("children", {}).get(key)
-            job = self.repo.get(project_path(project, "jobs", jid)) if jid else None
+            jid = children.get(key)
+            job = loaded.get(jid) if jid else None
             return {
                 "job_id": jid,
                 "status": job["status"] if job else "pending",
@@ -251,6 +277,8 @@ class ConversationCommands:
                 if job and job["status"] == "succeeded" and job["artifact_ids"]
                 else None,
                 "error": job.get("error") if job else None,
+                "created_at": job.get("created_at") if job else None,
+                "updated_at": job.get("updated_at") if job else None,
             }
 
         return {
@@ -305,6 +333,7 @@ class ConversationCommands:
                 if doc["title"] == "New video":
                     current["title"] = body.text[:120]
                 tx.set(conversation_path(project, conversation), current)
+                self.enqueue_advance(tx, project, "conversation", conversation)
                 return {"message_id": message["id"], "status": "queued"}
 
             return self._idempotent(
@@ -325,6 +354,10 @@ class ConversationCommands:
         doc = self.conversation(
             caller, project, conversation, scope=CANCEL if body.action == "cancel" else GENERATE
         )
+        if body.action == "remove_scene":
+            if not body.scene_id:
+                raise AppError("INVALID_INPUT", "Choose a scene to delete")
+            return self.remove_scene(caller, project, conversation, body.scene_id, body.idempotency_key)
         if body.action == "revise":
             if not body.instruction:
                 raise AppError("INVALID_INPUT", "Describe the revision")
@@ -359,9 +392,8 @@ class ConversationCommands:
                             caller, project, message["job_id"], body.idempotency_key + message["id"]
                         )
                     self.repo.atomic(
-                        lambda tx, m=message: tx.set(
-                            conversation_path(project, conversation) + "/messages/" + m["id"],
-                            {**m, "status": "cancelled"},
+                        lambda tx, m=message: set_message(
+                            tx, conversation_path(project, conversation), {**m, "status": "cancelled"}
                         )
                     )
             # Standalone edits and renders also belong to this conversation.
@@ -421,8 +453,9 @@ class ConversationCommands:
                 current["retried_by"] = handle.job_id
                 tx.set(project_path(project, "jobs", body.job_id), current)
                 if retry_message:
-                    tx.set(
-                        conversation_path(project, conversation) + "/messages/" + retry_message["id"],
+                    set_message(
+                        tx,
+                        conversation_path(project, conversation),
                         {
                             **retry_message,
                             "status": "running",
@@ -459,15 +492,14 @@ class ConversationCommands:
             jobs.append(("storyboard_job", story))
             if any(j and j["status"] == "submission_unknown" for _, j in jobs):
                 raise AppError("REVISION_CONFLICT", "Uncertain submissions require reconciliation", 409)
+            # With no failed job (e.g. the run stopped on a budget check), resuming is enough:
+            # the scheduler's idempotent submissions reuse finished jobs.
             failures = [(key, job) for key, job in jobs if job and job["status"] == "failed"]
-            if not failures:
-                raise AppError(
-                    "REVISION_CONFLICT",
-                    "No confirmed failed job can be retried. Revise the request instead.",
-                    409,
-                )
             run.update(
-                status="waiting_for_jobs", retry_owner=body.idempotency_key, version=run["version"] + 1
+                status="waiting_for_jobs",
+                retry_owner=body.idempotency_key,
+                version=run["version"] + 1,
+                error=None,
             )
             tx.set(run_path, run)
             self.project_run(tx, run)
@@ -513,7 +545,13 @@ class ConversationCommands:
             self.repo.atomic(restore)
             raise
         result = {"run_id": run["run_id"], "status": "waiting_for_jobs"}
-        self.repo.atomic(lambda tx: tx.set(marker, {"uid": caller.uid, "result": result}))
+
+        def remember(tx):
+            tx.set(marker, {"uid": caller.uid, "result": result})
+            # Resubmitted jobs advance the run when they finish; a run with none resumes now.
+            self.enqueue_advance(tx, project, "run", run["run_id"])
+
+        self.repo.atomic(remember)
         return DataResult(data=result)
 
 
@@ -522,85 +560,131 @@ class ConversationScheduler:
         self.c = commands
 
     def sweep(self):
-        from tools.commands import identifier, project_path
+        """Recovery pass. Advance events handle normal progress, so this reads only conversations
+        with an unfinished request or an unfinished run; idle projects cost no document reads."""
+        from execution.dispatch import live_matches
+        from tools.commands import project_path
 
         c = self.c
-        for project in c.repo.list("projects"):
-            pid = project.get("project_id")
-            if not pid:
+        waiting, candidates = set(), set()
+        for message_path, _ in c.repo.group_where(
+            "messages", "status", ["queued", "running", "needs_reconciliation"]
+        ):
+            parts = message_path.split("/")
+            if len(parts) == 6 and parts[0] == "projects" and parts[2] == "conversations":
+                waiting.add((parts[1], parts[3]))
+        unfinished = ["queued", "running", "waiting_for_jobs", "needs_approval", "needs_reconciliation"]
+        for pid, run in live_matches(c.repo, "runs", "status", unfinished):
+            if run.get("conversation_id"):
+                candidates.add((pid, run["conversation_id"]))
+        candidates = sorted(candidates | waiting)
+        if not candidates:
+            return
+        project_ids = sorted({pid for pid, _ in candidates})
+        live = {
+            pid
+            for pid, project in zip(
+                project_ids, c.repo.get_many([project_path(p) for p in project_ids]), strict=True
+            )
+            if project and not project.get("deleting")
+        }
+        candidates = [(pid, cid) for pid, cid in candidates if pid in live]
+        docs = c.repo.get_many([conversation_path(pid, cid) for pid, cid in candidates])
+        run_paths = sorted(
+            {
+                project_path(pid, "runs", d["active_run_id"])
+                for (pid, _), d in zip(candidates, docs, strict=True)
+                if d and d.get("active_run_id")
+            }
+        )
+        runs = dict(zip(run_paths, c.repo.get_many(run_paths), strict=True))
+        for (pid, cid), doc in zip(candidates, docs, strict=True):
+            if not doc or doc.get("deleting"):
                 continue
-            for doc in c.repo.list(project_path(pid, "conversations")):
-                path = conversation_path(pid, doc["id"])
-                pending = c.repo.list_where(
-                    path + "/messages", "status", ["queued", "running", "needs_reconciliation"]
-                )
-                active = (
-                    c.repo.get(project_path(pid, "runs", doc["active_run_id"]))
-                    if doc.get("active_run_id")
-                    else None
-                )
-                needs_sync = active and (
-                    doc.get("synced_run_id") != active["run_id"]
-                    or doc.get("synced_run_version") != active["version"]
-                )
-                if not pending and not needs_sync:
-                    continue
-                owner = identifier("chat_scheduler")
+            active = (
+                runs.get(project_path(pid, "runs", doc["active_run_id"]))
+                if doc.get("active_run_id")
+                else None
+            )
+            needs_sync = active and (
+                doc.get("synced_run_id") != active["run_id"]
+                or doc.get("synced_run_version") != active["version"]
+            )
+            if (pid, cid) in waiting or needs_sync:
+                self.resume(pid, doc)
 
-                def claim(tx, path=path, owner=owner):
+    def resume(self, pid, doc):
+        """Advance one conversation under its lease, recording an application failure on its request.
+
+        Returns False when another pass holds the lease, so an event can be redelivered.
+        """
+        from tools.commands import identifier
+
+        c = self.c
+        path = conversation_path(pid, doc["id"])
+        try:
+            owner = identifier("chat_scheduler")
+
+            def claim(tx):
+                latest = tx.get(path)
+                if latest.get("lease_expiry", 0) > c.clock():
+                    return False
+                latest.update(lease_owner=owner, lease_expiry=c.clock() + 30)
+                tx.set(path, latest)
+                return True
+
+            if not c.repo.atomic(claim):
+                return False
+            try:
+                self.advance(pid, c.repo.get(path))
+            except AppError as exc:
+                pending = next(
+                    (
+                        m
+                        for m in c.repo.list(path + "/messages")
+                        if m.get("status") in {"queued", "running", "needs_reconciliation"}
+                    ),
+                    None,
+                )
+                if pending:
+
+                    def record_error(tx, exc=exc):
+                        set_message(
+                            tx,
+                            path,
+                            {
+                                **pending,
+                                "status": "cancelled" if exc.payload.code == "ACCESS_DENIED" else "failed",
+                            },
+                        )
+                        append_message(
+                            c,
+                            tx,
+                            pid,
+                            doc["id"],
+                            "error:" + pending["id"],
+                            "assistant",
+                            exc.payload.message,
+                            [{"kind": "error"}],
+                        )
+                        self.follow_up(tx, pid, doc["id"])
+
+                    c.repo.atomic(record_error)
+            finally:
+
+                def release(tx):
                     latest = tx.get(path)
-                    if latest.get("lease_expiry", 0) > c.clock():
-                        return False
-                    latest.update(lease_owner=owner, lease_expiry=c.clock() + 30)
-                    tx.set(path, latest)
-                    return True
+                    if latest.get("lease_owner") == owner:
+                        latest["lease_expiry"] = 0
+                        tx.set(path, latest)
 
-                if not c.repo.atomic(claim):
-                    continue
-                try:
-                    self.advance(pid, c.repo.get(path))
-                except AppError as exc:
-                    pending = next(
-                        (
-                            m
-                            for m in c.repo.list(path + "/messages")
-                            if m.get("status") in {"queued", "running", "needs_reconciliation"}
-                        ),
-                        None,
-                    )
-                    if pending:
-
-                        def record_error(tx, pending=pending, pid=pid, doc=doc, path=path, exc=exc):
-                            tx.set(
-                                path + "/messages/" + pending["id"],
-                                {
-                                    **pending,
-                                    "status": "cancelled"
-                                    if exc.payload.code == "ACCESS_DENIED"
-                                    else "failed",
-                                },
-                            )
-                            append_message(
-                                c,
-                                tx,
-                                pid,
-                                doc["id"],
-                                "error:" + pending["id"],
-                                "assistant",
-                                exc.payload.message,
-                                [{"kind": "error"}],
-                            )
-
-                        c.repo.atomic(record_error)
-                finally:
-
-                    def release(tx, path=path, owner=owner):
-                        latest = tx.get(path)
-                        if latest.get("lease_owner") == owner:
-                            latest["lease_expiry"] = 0
-                            tx.set(path, latest)
-
-                    c.repo.atomic(release)
+                c.repo.atomic(release)
+        except Exception:
+            # A conversation erased mid-pass is skipped rather than stopping the worker.
+            if c.repo.get(path) is None:
+                return True
+            raise
+        return True
 
     def advance(self, project, doc):
         from tools.commands import project_path
@@ -632,9 +716,7 @@ class ConversationScheduler:
         try:
             c.authorize(caller, project, GENERATE)
         except AppError:
-            c.repo.atomic(
-                lambda tx: tx.set(path + "/messages/" + pending["id"], {**pending, "status": "cancelled"})
-            )
+            c.repo.atomic(lambda tx: set_message(tx, path, {**pending, "status": "cancelled"}))
             return
         scoped_jobs = c.repo.list_where(project_path(project, "jobs"), "conversation_id", [doc["id"]])
         if any(
@@ -693,10 +775,7 @@ class ConversationScheduler:
                 "director_turn",
             )
             c.repo.atomic(
-                lambda tx: tx.set(
-                    path + "/messages/" + pending["id"],
-                    {**pending, "job_id": handle.job_id, "status": "running"},
-                )
+                lambda tx: set_message(tx, path, {**pending, "job_id": handle.job_id, "status": "running"})
             )
             return
         job = c.repo.get(project_path(project, "jobs", pending["job_id"]))
@@ -704,16 +783,12 @@ class ConversationScheduler:
             return
         if job["status"] == "submission_unknown":
             if pending["status"] != "needs_reconciliation":
-                c.repo.atomic(
-                    lambda tx: tx.set(
-                        path + "/messages/" + pending["id"], {**pending, "status": "needs_reconciliation"}
-                    )
-                )
+                c.repo.atomic(lambda tx: set_message(tx, path, {**pending, "status": "needs_reconciliation"}))
             return
         if job["status"] != "succeeded":
 
             def failure(tx):
-                tx.set(path + "/messages/" + pending["id"], {**pending, "status": job["status"]})
+                set_message(tx, path, {**pending, "status": job["status"]})
                 append_message(
                     c,
                     tx,
@@ -724,6 +799,7 @@ class ConversationScheduler:
                     job.get("error", {}).get("message", "The request could not be completed."),
                     [{"kind": "error", "job_id": job["job_id"], "retryable": job["status"] == "failed"}],
                 )
+                self.follow_up(tx, project, doc["id"])
 
             c.repo.atomic(failure)
             return
@@ -736,10 +812,18 @@ class ConversationScheduler:
             blocks = []
 
         def complete(tx):
-            tx.set(path + "/messages/" + pending["id"], {**pending, "status": "succeeded"})
+            set_message(tx, path, {**pending, "status": "succeeded"})
             append_message(c, tx, project, doc["id"], "turn:" + pending["id"], "assistant", turn.text, blocks)
+            self.follow_up(tx, project, doc["id"])
 
         c.repo.atomic(complete)
+
+    def follow_up(self, tx, project, conversation):
+        """A finished request may leave another queued, and the active run pauses while requests are open."""
+        self.c.enqueue_advance(tx, project, "conversation", conversation)
+        active = tx.get(conversation_path(project, conversation)).get("active_run_id")
+        if active:
+            self.c.enqueue_advance(tx, project, "run", active)
 
     def apply_turn(self, caller, project, doc, message, turn, active):
         from tools.commands import project_path
@@ -837,7 +921,12 @@ class ConversationScheduler:
                     continue
                 if key.startswith("music") and (
                     old["music"] != plan.music.model_dump()
-                    or old["duration_seconds"] != plan.duration_seconds
+                    # Raw music still covers a shorter video; only its trimmed copy must be redone.
+                    or (
+                        old["duration_seconds"] != plan.duration_seconds
+                        if key == "music:prepared"
+                        else plan.duration_seconds > old["duration_seconds"]
+                    )
                 ):
                     continue
                 if ":" in key and key.split(":")[0] in previous:

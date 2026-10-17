@@ -1,4 +1,5 @@
 import json
+import sys
 from functools import cached_property
 from typing import Literal
 
@@ -31,7 +32,11 @@ class Settings(BaseSettings):
     music_location: str = "global"
     director_model: str = "gemini-2.5-flash"
     developer_api_key: str | None = None
-    adk_python: str = str(BACKEND_ROOT / "agents/creative_director/.venv/bin/python")
+    adk_python: str = str(
+        BACKEND_ROOT
+        / "agents/creative_director/.venv"
+        / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    )
     render_runner: Literal["docker", "local", "cloud_run"] = "docker"
     render_cloud_job: str | None = None
     render_image: str = "vibeshorts-render:local"

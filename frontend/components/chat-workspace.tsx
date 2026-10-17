@@ -3,7 +3,7 @@
 import Link from "next/link";
 import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowUp,
   Check,
@@ -22,13 +22,17 @@ import {
   Palette,
   Images,
   Sparkles,
+  Trash2,
   X,
 } from "lucide-react";
 import { signOut } from "firebase/auth";
 import { firebaseAuth } from "../lib/firebase";
 import { ApiError, call } from "../lib/api";
+import { subscribeConversation, throttle } from "../lib/realtime";
 import { operationKey, useWorkspace } from "../lib/workspace";
 import { useStudio } from "../lib/studio-store";
+import { confirmAction } from "../lib/confirm";
+import { LoadingState } from "./loading-state";
 import type {
   Asset,
   ChatMessage,
@@ -51,13 +55,18 @@ const ProductionView = dynamic(() =>
 );
 const TimelineCanvas = dynamic(
   () => import("./timeline-canvas").then((m) => m.TimelineCanvas),
-  { loading: () => <p role="status">Opening timeline…</p> },
+  {
+    loading: () => (
+      <LoadingState className="centered" label="Opening timeline…" />
+    ),
+  },
 );
 const InlineComposition = dynamic(() =>
   import("./preview").then((m) => m.CompositionPreview),
 );
 type Props = {
   conversations: Conversation[];
+  historyLoading: boolean;
   historyError?: string;
   conversationId: string | null;
   onSelect: (id: string | null) => void;
@@ -65,6 +74,7 @@ type Props = {
   onOpenRun: (id: string) => void;
   onCreateBlank: () => Promise<void>;
   onOpenComposition: (id: string) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
   hasMore: boolean;
   onMore: () => Promise<void>;
 };
@@ -72,6 +82,7 @@ const activeStates = ["queued", "running", "waiting_for_jobs"];
 
 export function ChatWorkspace({
   conversations,
+  historyLoading,
   historyError,
   conversationId,
   onSelect,
@@ -79,11 +90,13 @@ export function ChatWorkspace({
   onOpenRun,
   onCreateBlank,
   onOpenComposition,
+  onDelete,
   hasMore,
   onMore,
 }: Props) {
   const w = useWorkspace();
   const s = useStudio();
+  const queryClient = useQueryClient();
   const [sidebar, setSidebar] = useState(false);
   const [settings, setSettings] = useState(false);
   const [agentOpen, setAgentOpen] = useState(true);
@@ -119,20 +132,65 @@ export function ChatWorkspace({
     requestAnimationFrame(() => toolsButton.current?.focus());
   }
   const [newMessages, setNewMessages] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const sendKey = useRef<string | null>(null);
   const lastText = useRef("");
+  const queryKey = ["conversations", w.user.uid, w.projectId, conversationId];
+  // True while the Firestore listener is connected; polling then becomes a slow safety net.
+  const [live, setLive] = useState(false);
+  useEffect(() => {
+    setLive(false);
+    if (!conversationId) return;
+    const refetch = throttle(
+      () => void queryClient.invalidateQueries({ queryKey }),
+      1000,
+    );
+    const unsubscribe = subscribeConversation(
+      w.projectId,
+      conversationId,
+      refetch,
+      setLive,
+    );
+    return () => {
+      refetch.cancel();
+      unsubscribe();
+    };
+  }, [w.projectId, w.user.uid, conversationId]);
   const query = useQuery({
-    queryKey: ["conversations", w.user.uid, w.projectId, conversationId],
+    queryKey,
     enabled: !!conversationId,
-    queryFn: async () =>
-      (await call(`${w.base}/conversations/${conversationId}?tail=true`))
-        .data as ConversationState,
+    queryFn: async () => {
+      // After the first load, fetch only messages written since the revision already held.
+      const previous = queryClient.getQueryData<ConversationState>(queryKey);
+      const since =
+        previous?.revision !== undefined ? `&since=${previous.revision}` : "";
+      const state = (
+        await call(`${w.base}/conversations/${conversationId}?tail=true${since}`)
+      ).data as ConversationState;
+      if (!state.incremental || !previous) return state;
+      const merged = new Map(previous.messages.map((m) => [m.id, m]));
+      for (const message of state.messages) merged.set(message.id, message);
+      return {
+        ...state,
+        messages: [...merged.values()].sort((a, b) => a.sequence - b.sequence),
+        next_cursor: previous.next_cursor,
+      };
+    },
     retry: (count, e) =>
       !(e instanceof ApiError && e.status === 429) && count < 1,
     refetchInterval: (q) =>
       q.state.error instanceof ApiError && q.state.error.status === 429
         ? false
-        : q.state.data?.operations?.some(
+        : live
+          ? activeStates.includes(q.state.data?.run?.status || "") ||
+            q.state.data?.messages.some((m) =>
+              ["queued", "running", "needs_reconciliation"].includes(
+                m.status || "",
+              ),
+            )
+            ? 30000
+            : false
+          : q.state.data?.operations?.some(
               (j) => j.status === "submission_unknown",
             ) ||
             q.state.data?.messages.some(
@@ -143,15 +201,6 @@ export function ChatWorkspace({
                 ["queued", "running"].includes(m.status || ""),
               ) ||
               q.state.data?.operations?.some(
-                (j) =>
-                  ![
-                    "succeeded",
-                    "failed",
-                    "cancelled",
-                    "submission_unknown",
-                  ].includes(j.status),
-              ) ||
-              w.data?.jobs.some(
                 (j) =>
                   ![
                     "succeeded",
@@ -367,6 +416,27 @@ export function ChatWorkspace({
     setText(scene ? `Change ${scene}: ` : "Change the storyboard: ");
     input.current?.focus();
   }
+  async function deleteScene(scene: string, label: string) {
+    if (
+      !(await confirmAction({
+        title: "Delete this scene?",
+        message: `Your video will get shorter by the length of ${label}. The other scenes are kept and reused.`,
+        confirmLabel: "Delete scene",
+      }))
+    )
+      return;
+    void w.action(async () => {
+      await call(`${w.base}/conversations/${conversationId}/actions`, {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: operationKey(),
+          action: "remove_scene",
+          scene_id: scene,
+        }),
+      });
+      await refresh();
+    });
+  }
   const [leaveProjects, setLeaveProjects] = useState(false);
   async function goProjects() {
     if (s.dirty) {
@@ -468,7 +538,10 @@ export function ChatWorkspace({
         </button>
         <span className="workspace-breadcrumb">
           {w.data?.project.name || "Loading…"} /{" "}
-          <strong>{query.data?.conversation.title || "New video"}</strong>
+          <strong>
+            {query.data?.conversation.title ||
+              (conversationId ? "Loading…" : "New video")}
+          </strong>
         </span>
         <span className="chat-header-spacer" />
         <span className="workspace-status" role="status">
@@ -591,27 +664,60 @@ export function ChatWorkspace({
           <span className="chat-sidebar-label">Your videos</span>
           <nav>
             {conversations.map((c) => (
-              <button
-                key={c.id}
-                className={c.id === conversationId ? "selected" : ""}
-                onClick={() => {
-                  onSelect(c.id);
-                  setSidebar(false);
-                }}
-                title={c.title}
-              >
-                <Clapperboard size={15} />
-                <span>{c.title}</span>
-              </button>
+              <div className="chat-history-row" key={c.id}>
+                <button
+                  className={c.id === conversationId ? "selected" : ""}
+                  onClick={() => {
+                    onSelect(c.id);
+                    setSidebar(false);
+                  }}
+                  title={c.title}
+                >
+                  <Clapperboard size={15} />
+                  <span>{c.title}</span>
+                </button>
+                <button
+                  className="delete-button"
+                  disabled={w.busy}
+                  aria-label={`Delete video ${c.title}`}
+                  title="Delete video"
+                  onClick={async () => {
+                    if (
+                      await confirmAction({
+                        title: "Delete this video?",
+                        message: `“${c.title}” — its chat, storyboard, scenes and generated media — will be permanently erased. This can’t be undone.`,
+                        confirmLabel: "Delete video",
+                      })
+                    )
+                      void w.action(() => onDelete(c.id));
+                  }}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
             ))}
-            {!conversations.length && (
-              <p>Every idea gets its own conversation.</p>
+            {historyLoading ? (
+              <LoadingState label="Loading your videos…" />
+            ) : (
+              !conversations.length && (
+                <p>Every idea gets its own conversation.</p>
+              )
             )}
             {hasMore && (
-              <button onClick={() => void w.action(onMore)}>More videos</button>
+              <button
+                disabled={loadingMore}
+                onClick={() => {
+                  setLoadingMore(true);
+                  void w.action(onMore).finally(() => setLoadingMore(false));
+                }}
+              >
+                {loadingMore ? "Loading more videos…" : "More videos"}
+              </button>
             )}
           </nav>
-          {historyError && <p role="alert">{historyError}</p>}
+          {(historyError || w.error) && (
+            <p role="alert">{historyError || w.error}</p>
+          )}
           <div className="chat-sidebar-footer">
             <button onClick={() => void goProjects()}>← All projects</button>
             <button onClick={() => void signOut(firebaseAuth())}>
@@ -645,7 +751,7 @@ export function ChatWorkspace({
           }}
         >
           <div className="chat-thread">
-            {!messages.length && (
+            {!messages.length && !(conversationId && query.isPending) && (
               <div className="chat-welcome">
                 <span className="imagine-label">
                   <Sparkles size={18} /> 01 / IMAGINE
@@ -657,7 +763,10 @@ export function ChatWorkspace({
               </div>
             )}
             {conversationId && query.isPending && (
-              <p role="status">Loading your conversation…</p>
+              <LoadingState
+                className="centered"
+                label="Loading your conversation…"
+              />
             )}
             <ProductionPlan state={query.data} />
             {messages.map((message) => (
@@ -861,6 +970,9 @@ export function ChatWorkspace({
               <div className="chat-review">
                 <div>
                   <strong>A production step needs another try</strong>
+                  {query.data?.run?.error?.message && (
+                    <p role="alert">{query.data.run.error.message}</p>
+                  )}
                   <p>Your completed scenes are saved.</p>
                   <button
                     className="chat-button"
@@ -1192,8 +1304,10 @@ export function ChatWorkspace({
                 state={query.data}
                 onEdit={openTimeline}
                 onRevise={revise}
+                onDeleteScene={deleteScene}
                 onExport={() => void requestExport()}
                 busy={w.busy || generating || directionPending}
+                loading={query.isPending}
                 pendingPreview={pending.some((a) => a.kind === "preview")}
               />
             )}

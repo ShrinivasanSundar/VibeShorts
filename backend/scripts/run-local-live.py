@@ -32,13 +32,16 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
-    executable = str(root / "backend/.venv/bin/vibeshorts")
+    executable = str(
+        root / ("backend/.venv/Scripts/vibeshorts.exe" if sys.platform == "win32" else "backend/.venv/bin/vibeshorts")
+    )
+    npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
     services = [
         ("API", [executable, "serve", "--port", "8000"], os.environ.copy()),
         ("worker", [executable, "worker"], os.environ.copy()),
         (
             "frontend",
-            ["npm", "run", "dev", "--workspace", "frontend", "--", "--port", "3000"],
+            [npm_cmd, "run", "dev", "--workspace", "frontend", "--", "--port", "3000"],
             dict(os.environ, NODE_ENV="development"),
         ),
     ]
@@ -59,14 +62,20 @@ def main():
     finally:
         for _, process in processes:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                if sys.platform == "win32":
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
                 pass
         for _, process in processes:
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
 
 

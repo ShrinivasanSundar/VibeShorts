@@ -221,6 +221,14 @@ class StudioProvider:
         )
         if result.returncode:
             from execution.director_recovery import director_failure
+            from execution.telemetry import event
+
+            event(
+                "director_process_failed",
+                job_id=job["job_id"],
+                returncode=result.returncode,
+                stderr=result.stderr[-2000:],
+            )
 
             current = self.commands.repo.get(f"projects/{job['project_id']}/jobs/{job['job_id']}")
             usage = director_failure(self.commands.repo, current or job)
@@ -481,11 +489,14 @@ class StudioProvider:
                 "draft" if request.quality == "draft" else "delivery",
             ]
             if self.settings.render_runner == "docker":
-                render_uid = os.getuid() or 65532
-                render_gid = os.getgid() if os.getuid() else 65532
+                # Windows has no POSIX ids; Docker Desktop bind mounts are writable by the
+                # container's unprivileged user, so no ownership change is needed there.
+                host_uid = os.getuid() if hasattr(os, "getuid") else None
+                render_uid = host_uid or 65532
+                render_gid = os.getgid() if host_uid else 65532
                 scratch = directory / ".render-tmp"
                 scratch.mkdir()
-                if not os.getuid():
+                if host_uid == 0:
                     os.chown(directory, render_uid, render_gid)
                     os.chown(scratch, render_uid, render_gid)
                 args = [
@@ -536,7 +547,23 @@ class StudioProvider:
                 "HYPERFRAMES_NO_TELEMETRY": "1",
                 "DO_NOT_TRACK": "1",
             }
-            subprocess.run(args, check=True, capture_output=True, timeout=600, env=env)
+            # Windows programs need these to locate system DLLs, sockets and the Docker config.
+            for key in ("SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PROGRAMDATA"):
+                if os.environ.get(key):
+                    env[key] = os.environ[key]
+            try:
+                subprocess.run(args, check=True, capture_output=True, timeout=600, env=env)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                from execution.telemetry import event
+
+                stderr = getattr(exc, "stderr", None) or b""
+                event(
+                    "render_process_failed",
+                    runner=self.settings.render_runner,
+                    error=str(exc)[-500:],
+                    stderr=stderr.decode(errors="replace")[-2000:] if isinstance(stderr, bytes) else stderr,
+                )
+                raise AppError("RENDER_FAILED", "The video renderer failed; see the worker log", 503) from exc
             result = output.read_bytes()
             facts = inspect(result, "video/mp4")
             profile = manifest["output_profile"]

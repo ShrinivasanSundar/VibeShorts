@@ -16,6 +16,7 @@
     "emulators": "bash scripts/emulators.sh",
     "test:emulators": "bash scripts/emulators.sh test",
     "test:rules": "node --test backend/tests/rules.test.mjs",
+    "stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-dev.ps1",
     "inspector": "mcp-inspector"
   },
   "devDependencies": {

@@ -1,7 +1,30 @@
+from collections import OrderedDict
+from copy import deepcopy
+from threading import Lock
+
 from tools.composition.package import unpack
 from tools.contracts.errors import AppError
 from tools.contracts.models import GENERATE, DataResult, JobResult
 from tools.conversations import head_path
+
+# Parsed storyboards and composition manifests, keyed by verified content hash.
+# Artifacts are immutable, so entries never go stale; authorization is still checked per call.
+_DECODED: OrderedDict = OrderedDict()
+_DECODED_LOCK = Lock()
+
+
+def decoded(kind, digest, load):
+    key = (kind, digest)
+    with _DECODED_LOCK:
+        if key in _DECODED:
+            _DECODED.move_to_end(key)
+            return deepcopy(_DECODED[key])
+    value = load()
+    with _DECODED_LOCK:
+        _DECODED[key] = value
+        while len(_DECODED) > 512:
+            _DECODED.popitem(last=False)
+    return deepcopy(value)
 
 
 def input_ids(kind, value):
@@ -130,8 +153,11 @@ class StudioCommands:
         artifact = self._artifact(project_id, artifact_id)
         if artifact["type"] != "composition":
             raise AppError("INVALID_INPUT", "Artifact is not a composition")
-        data, _ = self.asset_content(caller, project_id, artifact_id)
-        manifest, _ = unpack(data)
+        manifest = decoded(
+            "manifest",
+            artifact["content_sha256"],
+            lambda: unpack(self.asset_content(caller, project_id, artifact_id)[0])[0],
+        )
         return DataResult(
             data={
                 "artifact_id": artifact_id,
@@ -141,43 +167,43 @@ class StudioCommands:
         )
 
     def get_storyboard(self, caller, project_id, artifact_id):
+        self.authorize(caller, project_id)
+        return DataResult(data=self._storyboard(caller, project_id, artifact_id))
+
+    def _storyboard(self, caller, project_id, artifact_id):
+        """Storyboard for an already-authorized caller; parsed content is cached by hash."""
         from tools.contracts.studio import Storyboard
 
-        self.authorize(caller, project_id)
-        if self._artifact(project_id, artifact_id)["type"] != "storyboard":
+        artifact = self._artifact(project_id, artifact_id)
+        if artifact["type"] != "storyboard":
             raise AppError("INVALID_INPUT", "Artifact is not a storyboard")
-        data, _ = self.asset_content(caller, project_id, artifact_id)
-        return DataResult(data=Storyboard.model_validate_json(data).model_dump())
+        return decoded(
+            "storyboard",
+            artifact["content_sha256"],
+            lambda: Storyboard.model_validate_json(
+                self.asset_content(caller, project_id, artifact_id)[0]
+            ).model_dump(),
+        )
 
     def studio_state(self, caller, project_id, conversation_id=None):
         from tools.commands import project_path
 
         project = self.authorize(caller, project_id)
-        jobs = self.repo.recent(project_path(project_id, "jobs"), 60)
-        runs = self.repo.recent(project_path(project_id, "runs"), 20)
-        approvals = self.repo.recent(project_path(project_id, "approvals"), 20)
-        approvals_by_id = {a["id"]: a for a in approvals}
         if conversation_id:
             conversation = self.conversation(caller, project_id, conversation_id)
             project = {**project, "composition_head": conversation.get("composition_head")}
-            jobs = sorted(
-                self.repo.list_where(project_path(project_id, "jobs"), "conversation_id", [conversation_id]),
-                key=lambda j: j["created_at"],
-                reverse=True,
-            )[:60]
-            runs = sorted(
-                self.repo.list_where(project_path(project_id, "runs"), "conversation_id", [conversation_id]),
-                key=lambda r: r["created_at"],
-                reverse=True,
-            )[:20]
-            approvals = sorted(
-                self.repo.list_where(
-                    project_path(project_id, "approvals"), "conversation_id", [conversation_id]
-                ),
-                key=lambda a: a["created_at"],
-                reverse=True,
-            )[:20]
-            approvals_by_id = {a["id"]: a for a in approvals}
+
+            def recent(collection, limit):
+                return self.repo.recent_where(
+                    project_path(project_id, collection), "conversation_id", conversation_id, limit
+                )
+        else:
+
+            def recent(collection, limit):
+                return self.repo.recent(project_path(project_id, collection), limit)
+
+        jobs, runs, approvals = recent("jobs", 60), recent("runs", 20), recent("approvals", 20)
+        approvals_by_id = {a["id"]: a for a in approvals}
         return DataResult(
             data={
                 "project": {
@@ -198,12 +224,11 @@ class StudioCommands:
                     | {"kind": j.get("kind", "image")}
                     for j in jobs
                 ],
-                "assets": self.list_assets(caller, project_id, 100).model_dump(),
+                # Assets load from /assets on demand; polling them here cost ~200 reads per call.
                 "approvals": approvals,
                 "brand": self.repo.get(
                     project_path(project_id, "brands", f"brand_{project['brand_version']}")
                 ),
-                "events": self.repo.recent(project_path(project_id, "events"), 60),
             }
         )
 
@@ -278,6 +303,10 @@ class StudioCommands:
                     run["version"] += 1
                     tx.set(project_path(project_id, "runs", run["run_id"]), run)
                     self.project_run(tx, run)
+                    if run.get("workflow"):
+                        self.enqueue_advance(tx, project_id, "run", run["run_id"])
+                if approval.get("conversation_id"):
+                    self.enqueue_advance(tx, project_id, "conversation", approval["conversation_id"])
                 return approval
 
             return self._idempotent(

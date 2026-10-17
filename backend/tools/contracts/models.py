@@ -134,6 +134,7 @@ class RunResult(Contract):
     pending_approval_id: str | None = None
     approval: dict[str, Any] | None = None
     workflow: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
 
 
 class DataResult(Contract):

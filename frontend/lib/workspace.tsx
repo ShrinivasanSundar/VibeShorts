@@ -10,8 +10,9 @@ import {
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { User } from "firebase/auth";
+import { track } from "./loading";
 import { ApiError, call, request } from "./api";
-import { subscribeRunSummaries } from "./realtime";
+import { subscribeRunSummaries, throttle } from "./realtime";
 import { useStudio } from "./studio-store";
 import type { Asset, StudioState } from "./studio-types";
 
@@ -56,18 +57,28 @@ function useWorkspaceState(
           ? 15000
           : false,
   });
-  useEffect(
-    () =>
-      subscribeRunSummaries(projectId, () => {
-        void client.invalidateQueries({
-          queryKey: ["studio", user.uid, projectId],
-        });
-        void client.invalidateQueries({
-          queryKey: ["conversations", user.uid, projectId],
-        });
-      }),
-    [projectId, user.uid, client],
-  );
+  useEffect(() => {
+    // The first snapshot repeats the initial fetch, and a single job transition can
+    // fire several snapshots, so skip the first and refetch at most once a second.
+    let first = true;
+    const refetch = throttle(() => {
+      void client.invalidateQueries({
+        queryKey: ["studio", user.uid, projectId, conversationId],
+        exact: true,
+      });
+      void client.invalidateQueries({
+        queryKey: ["conversations", user.uid, projectId],
+      });
+    }, 1000);
+    const unsubscribe = subscribeRunSummaries(projectId, () => {
+      if (first) first = false;
+      else refetch();
+    });
+    return () => {
+      refetch.cancel();
+      unsubscribe();
+    };
+  }, [projectId, user.uid, client, conversationId]);
   useEffect(() => {
     loaded.current = null;
     setHead(null);
@@ -108,6 +119,7 @@ function useWorkspaceState(
   async function refresh() {
     await Promise.all([
       query.refetch(),
+      client.invalidateQueries({ queryKey: ["assets", user.uid, projectId] }),
       client.invalidateQueries({
         queryKey: ["conversations", user.uid, projectId],
       }),
@@ -118,8 +130,10 @@ function useWorkspaceState(
     setError("");
     setNotice("");
     try {
-      await task();
-      await refresh();
+      await track(async () => {
+        await task();
+        await refresh();
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
