@@ -81,21 +81,30 @@ class FirestoreSessionService(BaseSessionService):
         record = self.repo.get(path)
         if not record:
             return None
-        events = sorted(self.repo.list(path + "/events"), key=lambda e: e["sequence"])
+        filters = []
         if config and getattr(config, "after_timestamp", None):
-            events = [e for e in events if e["event"]["timestamp"] > config.after_timestamp]
-        if config and getattr(config, "num_recent_events", None):
-            events = events[-config.num_recent_events :]
+            filters.append(("event.timestamp", ">", config.after_timestamp))
+        limit = getattr(config, "num_recent_events", None) if config else None
+        if filters:
+            # Timestamp order satisfies Firestore's inequality requirement.
+            order = [("event.timestamp", bool(limit)), ("sequence", bool(limit))]
+        else:
+            order = [("sequence", bool(limit))]
+        events = self.repo.query(path + "/events", filters=filters, order=order, limit=limit)
+        events.sort(key=lambda event: event["sequence"])
         return self._session(record, [Event.model_validate(e["event"]) for e in events])
 
     async def list_sessions(self, *, app_name, user_id, **kwargs):
         self._authorize()
         self._path(app_name, user_id, "validation")
-        records = [
-            r
-            for r in self.repo.list("adk_sessions")
-            if r["project_id"] == self.project_id and r["user_id"] == user_id and r["app_name"] == app_name
-        ]
+        records = self.repo.query(
+            "adk_sessions",
+            filters=[
+                ("project_id", "==", self.project_id),
+                ("user_id", "==", user_id),
+                ("app_name", "==", app_name),
+            ],
+        )
         return ListSessionsResponse(sessions=[self._session(r, []) for r in records])
 
     async def delete_session(self, *, app_name, user_id, session_id, **kwargs):

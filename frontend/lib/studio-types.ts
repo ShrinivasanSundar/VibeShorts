@@ -98,8 +98,10 @@ export type StudioState = {
   };
   runs: Run[];
   jobs: Job[];
+  assets: { assets: Asset[]; next_cursor: string | null };
   approvals: Approval[];
   brand: Brand | null;
+  events: { sequence: number; status: string; created_at: number }[];
 };
 export const emptyTimeline: Timeline = {
   fonts: {},
@@ -171,6 +173,8 @@ export type ConversationState = {
   revision?: number;
   /** True when `messages` holds only messages written after `since`. */
   incremental?: boolean;
+  approvals?: Approval[];
+  has_pending_message?: boolean;
   production?: ProductionSummary;
   conversation: Conversation;
   messages: ChatMessage[];

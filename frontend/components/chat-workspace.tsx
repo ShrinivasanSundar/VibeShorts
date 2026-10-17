@@ -3,7 +3,6 @@
 import Link from "next/link";
 import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowUp,
   Check,
@@ -28,9 +27,8 @@ import {
 import { signOut } from "firebase/auth";
 import { firebaseAuth } from "../lib/firebase";
 import { ApiError, call } from "../lib/api";
-import { subscribeConversation, throttle } from "../lib/realtime";
 import { operationKey, useWorkspace } from "../lib/workspace";
-import { useStudio } from "../lib/studio-store";
+import { useEditor } from "../lib/studio-store";
 import { confirmAction } from "../lib/confirm";
 import { LoadingState } from "./loading-state";
 import type {
@@ -95,8 +93,7 @@ export function ChatWorkspace({
   onMore,
 }: Props) {
   const w = useWorkspace();
-  const s = useStudio();
-  const queryClient = useQueryClient();
+  const s = useEditor();
   const [sidebar, setSidebar] = useState(false);
   const [settings, setSettings] = useState(false);
   const [agentOpen, setAgentOpen] = useState(true);
@@ -135,85 +132,7 @@ export function ChatWorkspace({
   const [loadingMore, setLoadingMore] = useState(false);
   const sendKey = useRef<string | null>(null);
   const lastText = useRef("");
-  const queryKey = ["conversations", w.user.uid, w.projectId, conversationId];
-  // True while the Firestore listener is connected; polling then becomes a slow safety net.
-  const [live, setLive] = useState(false);
-  useEffect(() => {
-    setLive(false);
-    if (!conversationId) return;
-    const refetch = throttle(
-      () => void queryClient.invalidateQueries({ queryKey }),
-      1000,
-    );
-    const unsubscribe = subscribeConversation(
-      w.projectId,
-      conversationId,
-      refetch,
-      setLive,
-    );
-    return () => {
-      refetch.cancel();
-      unsubscribe();
-    };
-  }, [w.projectId, w.user.uid, conversationId]);
-  const query = useQuery({
-    queryKey,
-    enabled: !!conversationId,
-    queryFn: async () => {
-      // After the first load, fetch only messages written since the revision already held.
-      const previous = queryClient.getQueryData<ConversationState>(queryKey);
-      const since =
-        previous?.revision !== undefined ? `&since=${previous.revision}` : "";
-      const state = (
-        await call(`${w.base}/conversations/${conversationId}?tail=true${since}`)
-      ).data as ConversationState;
-      if (!state.incremental || !previous) return state;
-      const merged = new Map(previous.messages.map((m) => [m.id, m]));
-      for (const message of state.messages) merged.set(message.id, message);
-      return {
-        ...state,
-        messages: [...merged.values()].sort((a, b) => a.sequence - b.sequence),
-        next_cursor: previous.next_cursor,
-      };
-    },
-    retry: (count, e) =>
-      !(e instanceof ApiError && e.status === 429) && count < 1,
-    refetchInterval: (q) =>
-      q.state.error instanceof ApiError && q.state.error.status === 429
-        ? false
-        : live
-          ? activeStates.includes(q.state.data?.run?.status || "") ||
-            q.state.data?.messages.some((m) =>
-              ["queued", "running", "needs_reconciliation"].includes(
-                m.status || "",
-              ),
-            )
-            ? 30000
-            : false
-          : q.state.data?.operations?.some(
-              (j) => j.status === "submission_unknown",
-            ) ||
-            q.state.data?.messages.some(
-              (m) => m.status === "needs_reconciliation",
-            )
-          ? 15000
-          : q.state.data?.messages.some((m) =>
-                ["queued", "running"].includes(m.status || ""),
-              ) ||
-              q.state.data?.operations?.some(
-                (j) =>
-                  ![
-                    "succeeded",
-                    "failed",
-                    "cancelled",
-                    "submission_unknown",
-                  ].includes(j.status),
-              )
-            ? 2500
-            : activeStates.includes(q.state.data?.run?.status || "")
-              ? 5000
-              : false,
-  });
+  const query = w.conversationQuery;
   useEffect(() => {
     setSidebar(false);
   }, []);
@@ -287,10 +206,6 @@ export function ChatWorkspace({
       return () => clearTimeout(timer);
     }
   }, [canvas]);
-  useEffect(() => {
-    const head = query.data?.conversation.composition_head;
-    if (head && head !== w.data?.project.composition_head) void w.refresh();
-  }, [query.data?.conversation.composition_head]);
   const previousHead = useRef<string | null>(null);
   useEffect(() => {
     const head = query.data?.conversation.composition_head;
@@ -326,7 +241,7 @@ export function ChatWorkspace({
         ),
     );
   async function refresh() {
-    await Promise.all([w.refresh(), query.refetch()]);
+    await w.refresh();
   }
   async function send() {
     if (!text.trim() || w.busy) return;
@@ -375,7 +290,6 @@ export function ChatWorkspace({
       setAttachments([]);
       sendKey.current = null;
       atBottom.current = true;
-      await refresh();
     });
   }
   async function accept(approvalId: string, target: string) {
@@ -395,7 +309,6 @@ export function ChatWorkspace({
           composition_artifact_id: target,
           quality: "final",
         });
-      await refresh();
     });
   }
   async function download(id: string) {
@@ -449,8 +362,7 @@ export function ChatWorkspace({
     if (s.dirty) {
       await w.action(async () => {
         await w.save();
-        await refresh();
-        setCanvas(false);
+          setCanvas(false);
         w.setNotice(
           "Your new revision is saved. Review it, then approve and export.",
         );
@@ -486,7 +398,6 @@ export function ChatWorkspace({
         w.setNotice(
           "Review this exact version, then choose Approve and export.",
         );
-      await refresh();
     });
   }
   const currentHead = query.data?.conversation.composition_head;
@@ -853,8 +764,7 @@ export function ChatWorkspace({
                                       }),
                                     },
                                   );
-                                  await refresh();
-                                })
+                                                            })
                             : undefined
                         }
                         currentStoryboard={
@@ -988,8 +898,7 @@ export function ChatWorkspace({
                             }),
                           },
                         );
-                        await refresh();
-                      })
+                                        })
                     }
                   >
                     Retry failed step
@@ -1197,8 +1106,7 @@ export function ChatWorkspace({
                           }),
                         },
                       );
-                      await refresh();
-                    })
+                                    })
                   }
                 >
                   <Square size={16} />

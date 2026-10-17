@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 
+from execution.read_context import read_command
 from execution.storage import MAX_UPLOAD
 from execution.telemetry import event
 from tools.contracts.errors import AppError
@@ -56,6 +57,9 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
     def __init__(self, repo, storage, identity, provider, settings, clock=time.time):
         self.repo, self.storage, self.identity = repo, storage, identity
         self.provider, self.settings, self.clock = provider, settings, clock
+        from execution.content_cache import ContentCache
+
+        self.content_cache = ContentCache()
         # Set by processes that can publish; without it the scheduled dispatch sends the outbox.
         self.publisher = None
         from execution.dispatch import RecentlyPublished
@@ -101,8 +105,14 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
     def provision(self, caller: Caller):
         self.identity.check_uid(caller.uid, caller.auth_time)
 
+        path = "users/" + checked_id(caller.uid)
+        existing = self.repo.get(path)
+        if existing is not None:
+            if not existing["access_enabled"]:
+                raise AppError("ACCESS_DENIED", "Application access is disabled", 403)
+            return existing
+
         def apply(tx):
-            path = "users/" + checked_id(caller.uid)
             user = tx.get(path)
             if user is None:
                 user = {
@@ -220,16 +230,18 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
 
         return DataResult(data=self.repo.atomic(apply))
 
+    @read_command
     def list_projects(self, caller):
         self.provision(caller)
         return DataResult(
             data={
                 "projects": [
                     {k: p[k] for k in ("project_id", "name", "brand_version")}
-                    for p in self.repo.list_where(
-                        "projects", ("members", caller.uid), ["owner", "editor", "viewer"]
+                    for p in self.repo.query(
+                        "projects", filters=[(("members", caller.uid), "in", ["owner", "editor", "viewer"])]
                     )
-                    if not p.get("deleting")
+                    if caller.uid in p["members"]
+                    and not p.get("deleting")
                     and (caller.projects is None or p["project_id"] in caller.projects)
                 ]
             }
@@ -279,6 +291,7 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
 
         return DataResult(data=self.repo.atomic(apply))
 
+    @read_command
     def get_brand_dna(self, caller, project_id, version=None):
         project = self.authorize(caller, project_id)
         version = project["brand_version"] if version is None else version
@@ -313,6 +326,10 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
                     "pending_approval_id",
                     "created_at",
                 )
+            }
+            | {
+                "conversation_id": run.get("conversation_id"),
+                "sync_pending": bool(run.get("workflow") and run.get("conversation_id")),
             },
         )
 
@@ -595,6 +612,7 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
 
         return JobHandle(**self.repo.atomic(apply))
 
+    @read_command
     def get_job(self, caller, project_id, job_id):
         self.authorize(caller, project_id)
         job = self.repo.get(project_path(project_id, "jobs", job_id))
@@ -602,6 +620,7 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
             raise AppError("NOT_FOUND", "Job not found", 404)
         return JobResult(**{k: job[k] for k in JobResult.model_fields if k in job})
 
+    @read_command
     def get_run(self, caller, project_id, run_id):
         self.authorize(caller, project_id)
         return self._load_run(project_id, run_id)
@@ -818,6 +837,7 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
         )
         event("budget_settled", job_id=job["job_id"], amount_micros=amount, discrepancy_micros=discrepancy)
 
+    @read_command
     def get_asset(self, caller, project_id, artifact_id):
         self.authorize(caller, project_id)
         artifact = self._artifact(project_id, artifact_id)
@@ -832,18 +852,25 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
             )
         return DataResult(data=public)
 
+    @read_command
     def asset_content(self, caller, project_id, artifact_id):
         self.authorize(caller, project_id)
         artifact = self._artifact(project_id, artifact_id)
         path = self.repo.get(project_path(project_id, "artifact_lifecycle", artifact_id))["object_path"]
-        stored = self.storage.get(path)
-        if not stored:
-            raise AppError("ARTIFACT_UNAVAILABLE", "Stored artifact unavailable", 409)
-        data, _ = stored
-        if hashlib.sha256(data).hexdigest() != artifact["content_sha256"]:
-            raise AppError("ARTIFACT_UNAVAILABLE", "Artifact content verification failed", 409)
+
+        def verified():
+            stored = self.storage.get(path)
+            if not stored:
+                raise AppError("ARTIFACT_UNAVAILABLE", "Stored artifact unavailable", 409)
+            data, _ = stored
+            if hashlib.sha256(data).hexdigest() != artifact["content_sha256"]:
+                raise AppError("ARTIFACT_UNAVAILABLE", "Artifact content verification failed", 409)
+            return data
+
+        data = self.content_cache.load((path, artifact["content_sha256"]), verified)
         return data, artifact["media"]["mime_type"]
 
+    @read_command
     def list_assets(self, caller, project_id, limit=20, cursor=None, type=None, status=None):
         self.authorize(caller, project_id)
         if (
@@ -899,10 +926,12 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
             ).decode()
         return AssetPage(assets=page, next_cursor=next_cursor)
 
+    @read_command
     def get_project_context(self, caller, project_id):
         project = self.authorize(caller, project_id)
         return DataResult(data={k: project[k] for k in ("project_id", "name", "brand_version", "created_at")})
 
+    @read_command
     def get_capabilities(self, caller, project_id):
         self.authorize(caller, project_id)
         snapshot = self.provider.snapshot()

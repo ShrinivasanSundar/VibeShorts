@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useWorkspace } from "../lib/workspace";
 import { call, request } from "../lib/api";
-import { useStudio } from "../lib/studio-store";
+import { useStudio, useEditor } from "../lib/studio-store";
 import type { Asset, Brand, Clip } from "../lib/studio-types";
 import { PrivateMedia } from "./private-media";
 import { LoadingState } from "./loading-state";
@@ -78,13 +78,15 @@ export function WorkspaceTools({
     base,
     data,
     busy,
-    action,
+    action: workspaceAction,
     submit,
     importAsset,
     download,
     setNotice,
   } = w;
-  const s = useStudio();
+  const action = (task: () => Promise<unknown>) => workspaceAction(task, true);
+  const s = useEditor();
+  useEffect(() => w.loadResources(), []);
   const [tab, setTab] = useState(panel);
   const [brand, setBrand] = useState<Brand>(blankBrand);
   const [assetFilter, setAssetFilter] = useState("all");

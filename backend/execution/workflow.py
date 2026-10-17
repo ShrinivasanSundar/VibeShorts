@@ -138,6 +138,31 @@ class WorkflowScheduler:
 
     def advance(self, project, run_id):
         """One scheduler pass. Returns False only when another pass holds the run's lease."""
+        current = self.commands.repo.get(project_path(project, "runs", run_id))
+        if not current or current["status"] in {"cancelled", "failed", "succeeded"}:
+            return True
+        conversation = (
+            self.commands.repo.get(conversation_path(project, current["conversation_id"]))
+            if current.get("conversation_id")
+            else None
+        )
+        pending = (
+            self.commands.repo.query(
+                conversation_path(project, current["conversation_id"]) + "/messages",
+                filters=[("status", "in", ["queued", "running"])],
+                limit=1,
+            )
+            if conversation
+            else []
+        )
+        # Nothing that a pass reads has changed since the last one, so skip its lease transaction.
+        signature = [
+            current["version"],
+            conversation.get("sequence", 0) if conversation else 0,
+            bool(pending),
+        ]
+        if current.get("scheduler_seen") == signature:
+            return True
         owner = identifier("scheduler")
         busy = object()
 
@@ -176,6 +201,7 @@ class WorkflowScheduler:
                 current = tx.get(path)
                 if current and current.get("scheduler_owner") == owner:
                     current["scheduler_expiry"] = 0
+                    current["scheduler_seen"] = signature
                     tx.set(path, current)
 
             self.commands.repo.atomic(release)
@@ -197,8 +223,13 @@ class WorkflowScheduler:
             if conversation.get("active_run_id") != run_id:
                 change(project, run_id, status="cancelled")
                 return
-            messages = c.repo.list(conversation_path(project, cid) + "/messages")
-            queued_changes = any(m.get("status") in {"queued", "running"} for m in messages)
+            queued_changes = bool(
+                c.repo.query(
+                    conversation_path(project, cid) + "/messages",
+                    filters=[("status", "in", ["queued", "running"])],
+                    limit=1,
+                )
+            )
             if queued_changes and not (flow.get("mode") == "guided" and flow.get("current_scene_id")):
                 return
 

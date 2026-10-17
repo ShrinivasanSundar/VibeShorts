@@ -17,3 +17,9 @@ def event(name: str, **fields):
 def metrics() -> dict:
     with lock:
         return dict(counts)
+
+
+def record(name: str, amount: int = 1):
+    """Aggregate physical repository work without logging documents or user data."""
+    with lock:
+        counts[name] += amount

@@ -183,6 +183,8 @@ class Reconciler:
                 and self.commands.clock() - job.get("updated_at", 0) < QUEUED_GRACE_SECONDS
             ):
                 continue  # Its dispatch is likely in flight; re-queueing now only publishes a duplicate.
+            if job.get("next_poll_at", 0) > self.commands.clock():
+                continue
             candidate = self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
             from execution.director_recovery import recover_director_failure
 
@@ -196,11 +198,13 @@ class Reconciler:
                     not current
                     or current["status"] in {"succeeded", "failed", "cancelled"}
                     or current["lease_expires_at"] > self.commands.clock()
+                    or current.get("next_poll_at", 0) > self.commands.clock()
                 ):
                     return False
                 current["lease_owner"], current["lease_expires_at"] = None, 0
                 if current.get("provider_operation") and not candidate:
-                    self.commands.transition(tx, current, "waiting_for_provider")
+                    if current["status"] != "waiting_for_provider":
+                        self.commands.transition(tx, current, "waiting_for_provider")
                     current["next_poll_at"] = self.commands.clock()
                     tx.set(project_path(project_id, "jobs", current["job_id"]), current)
                     tx.set(

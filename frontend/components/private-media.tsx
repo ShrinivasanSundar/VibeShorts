@@ -4,6 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { request } from "../lib/api";
 import { projectRoot } from "../lib/workspace";
 import { Reel } from "./loading-state";
+import { acquireMedia } from "../lib/media-cache";
+import { useVisible } from "../lib/use-visible";
+
 
 // A shared play event also pauses compositions in the editor and historical cards.
 export function claimPlayback(owner: object) {
@@ -24,32 +27,15 @@ export function PrivateMedia({
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
   const video = useRef<HTMLVideoElement>(null);
+  const { ref: loadingRef, visible } = useVisible<HTMLDivElement>();
   useEffect(() => {
+    setUrl(""); setError("");
+    if (!visible) return;
     let active = true;
-    let object = "";
-    const abort = new AbortController();
-    setUrl("");
-    setError("");
-    void request(
-      `${projectRoot(projectId)}/assets/${encodeURIComponent(artifactId)}/content`,
-      { signal: abort.signal },
-    )
-      .then((r) => r.blob())
-      .then((blob) => {
-        object = URL.createObjectURL(blob);
-        if (active) setUrl(object);
-        else URL.revokeObjectURL(object);
-      })
-      .catch((e) => {
-        if (active) setError(e.message);
-      });
-    return () => {
-      active = false;
-      abort.abort();
-      video.current?.pause();
-      if (object) URL.revokeObjectURL(object);
-    };
-  }, [projectId, artifactId]);
+    const media = acquireMedia(projectId, artifactId);
+    void media.ready.then(({ url }) => active && setUrl(url)).catch(e => active && setError(e.message));
+    return () => { active = false; video.current?.pause(); media.release(); };
+  }, [projectId, artifactId, visible]);
   useEffect(() => {
     const pause = (event: Event) => {
       if ((event as CustomEvent).detail !== video.current)
@@ -61,9 +47,8 @@ export function PrivateMedia({
   if (error) return <p role="alert">{error}</p>;
   if (!url)
     return (
-      <div className="chat-media-loading" role="status">
-        <Reel />
-        <span>Loading preview…</span>
+      <div ref={loadingRef} className="chat-media-loading" role="status">
+        Loading preview…
       </div>
     );
   return image ? (

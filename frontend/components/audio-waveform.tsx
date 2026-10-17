@@ -1,49 +1,18 @@
 "use client";
 import { useEffect, useState } from "react";
-import { request } from "../lib/api";
+import { acquireMedia } from "../lib/media-cache";
 import { useWorkspace } from "../lib/workspace";
 
 export function AudioWaveform({ artifactId }: { artifactId: string }) {
   const w = useWorkspace();
   const [values, setValues] = useState<number[]>([]);
   useEffect(() => {
-    const abort = new AbortController();
     let active = true;
-    let context: AudioContext | undefined;
     setValues([]);
-    void request(`${w.base}/assets/${artifactId}/content`, {
-      signal: abort.signal,
-    })
-      .then((r) => r.arrayBuffer())
-      .then(async (data) => {
-        if (!active) return;
-        context = new AudioContext();
-        const audio = await context.decodeAudioData(data);
-        const samples = audio.getChannelData(0);
-        const chunk = Math.max(1, Math.floor(samples.length / 100));
-        const peaks = Array.from({ length: 100 }, (_, i) => {
-          let peak = 0;
-          for (
-            let j = i * chunk;
-            j < Math.min(samples.length, (i + 1) * chunk);
-            j++
-          )
-            peak = Math.max(peak, Math.abs(samples[j]));
-          return peak;
-        });
-        if (active) setValues(peaks);
-      })
-      .catch(() => {
-        /* Keep the audio clip editable if decoding is unavailable. */
-      })
-      .finally(() => {
-        void context?.close();
-      });
-    return () => {
-      active = false;
-      abort.abort();
-    };
-  }, [w.base, artifactId]);
+    const media = acquireMedia(w.projectId, artifactId);
+    void media.waveform().then(values => active && setValues(values)).catch(() => {});
+    return () => { active = false; media.release(); };
+  }, [w.projectId, artifactId]);
   if (!values.length) return null;
   const peak = Math.max(...values, 0.001);
   return (

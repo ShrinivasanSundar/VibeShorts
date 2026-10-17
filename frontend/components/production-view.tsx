@@ -395,7 +395,7 @@ function AuthenticatedAudio({ artifactId }: { artifactId: string }) {
   return <AudioPreview artifactId={artifactId} />;
 }
 import { useEffect, useRef } from "react";
-import { request } from "../lib/api";
+import { acquireMedia } from "../lib/media-cache";
 import { claimPlayback } from "./private-media";
 function AudioPreview({ artifactId }: { artifactId: string }) {
   const w = useWorkspace(),
@@ -404,54 +404,13 @@ function AudioPreview({ artifactId }: { artifactId: string }) {
     [error, setError] = useState(""),
     [wave, setWave] = useState<number[]>([]);
   useEffect(() => {
-    const abort = new AbortController();
-    let object = "",
-      active = true;
-    let context: AudioContext | undefined;
-    void request(`${w.base}/assets/${artifactId}/content`, {
-      signal: abort.signal,
-    })
-      .then((r) => r.blob())
-      .then(async (blob) => {
-        object = URL.createObjectURL(blob);
-        if (!active) {
-          URL.revokeObjectURL(object);
-          return;
-        }
-        setUrl(object);
-        try {
-          context = new AudioContext();
-          const buffer = await context.decodeAudioData(
-            await blob.arrayBuffer(),
-          );
-          const samples = buffer.getChannelData(0);
-          const chunk = Math.max(1, Math.floor(samples.length / 100));
-          const values = Array.from({ length: 100 }, (_, i) => {
-            let peak = 0;
-            for (
-              let j = i * chunk;
-              j < Math.min(samples.length, (i + 1) * chunk);
-              j++
-            )
-              peak = Math.max(peak, Math.abs(samples[j]));
-            return peak;
-          });
-          if (active) setWave(values);
-        } catch {
-          /* Playback remains available when waveform decoding is unsupported. */
-        } finally {
-          void context?.close();
-        }
-      })
-      .catch((e) => {
-        if (active) setError(e.message);
-      });
-    return () => {
-      active = false;
-      abort.abort();
-      if (object) URL.revokeObjectURL(object);
-    };
-  }, [w.base, artifactId]);
+    let active = true;
+    setUrl(""); setError(""); setWave([]);
+    const media = acquireMedia(w.projectId, artifactId);
+    void media.ready.then(({ url }) => active && setUrl(url)).catch(e => active && setError(e.message));
+    void media.waveform().then(wave => active && setWave(wave)).catch(() => {});
+    return () => { active = false; audio.current?.pause(); media.release(); };
+  }, [w.projectId, artifactId]);
   useEffect(() => {
     const pause = (event: Event) => {
       if ((event as CustomEvent).detail !== audio.current)

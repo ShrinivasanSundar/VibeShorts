@@ -167,7 +167,7 @@ def test_known_video_handle_retries_poll_only(runtime, alice, project, monkeypat
     monkeypatch.setattr(runtime.commands, "provider_for", lambda kind: provider)
     assert runtime.worker.execute(project, handle.job_id)
     restarted = Runtime(runtime.commands)
-    runtime.commands.clock.advance(11)
+    runtime.commands.clock.advance(runtime.commands.repo.get(path)["next_poll_at"] - runtime.commands.clock() + 1)
     assert restarted.worker.execute(project, handle.job_id)
     assert provider.submits == 0 and provider.polls == 2
     assert runtime.commands.repo.get(path)["provider_operation"]["name"] == "known-operation"

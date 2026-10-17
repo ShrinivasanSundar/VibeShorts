@@ -1,5 +1,5 @@
 import { getApp } from "firebase/app";
-import { collection, connectFirestoreEmulator, doc, getFirestore, onSnapshot } from "firebase/firestore";
+import { connectFirestoreEmulator, doc, getFirestore, onSnapshot } from "firebase/firestore";
 let connected=false;
 function database() {
   const db=getFirestore(getApp());
@@ -9,8 +9,16 @@ function database() {
   }
   return db;
 }
-export function subscribeRunSummaries(projectId:string,onChange:()=>void) {
-  return onSnapshot(collection(database(),"projects",projectId,"run_summaries"),onChange,()=>{/* Authenticated API polling remains the fallback. */});
+export type RunActivity={job_id:string;status:string;updated_at:number};
+// One small document per run holds its latest job step, so progress costs one read per change
+// instead of the whole run_summaries collection on every subscribe and reconnect.
+export function subscribeRunActivity(projectId:string,runId:string,onChange:(activity:RunActivity)=>void) {
+  let first=true;
+  return onSnapshot(doc(database(),"projects",projectId,"run_summaries",runId+"_activity"),snapshot=>{
+    const data=snapshot.data() as RunActivity|undefined;
+    if(first){first=false;return;} // The first snapshot repeats what the last fetch already showed.
+    if(data)onChange(data);
+  },()=>{/* Authenticated API polling remains the fallback. */});
 }
 // Scheduler leases rewrite the conversation document without changing what the user sees.
 const LEASE_FIELDS=new Set(["lease_owner","lease_expiry"]);

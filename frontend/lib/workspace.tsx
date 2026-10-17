@@ -12,13 +12,45 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { User } from "firebase/auth";
 import { track } from "./loading";
 import { ApiError, call, request } from "./api";
-import { subscribeRunSummaries, throttle } from "./realtime";
-import { useStudio } from "./studio-store";
-import type { Asset, StudioState } from "./studio-types";
+import { clearMediaCache } from "./media-cache";
+import { conversationIsActive, pollDelay, progressKey } from "./polling";
+import { subscribeConversation, subscribeRunActivity, throttle, type RunActivity } from "./realtime";
+import { useStudio, useEditor } from "./studio-store";
+import type { Asset, ConversationState, ProductionStep, StudioState } from "./studio-types";
 
 export const projectRoot = (id: string) =>
   `/v1/projects/${encodeURIComponent(id)}`;
 export const operationKey = () => crypto.randomUUID();
+type PendingSave = { jobId: string; submitted: string; started: number };
+function wait(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const cancel = () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", cancel); resolve(); }, ms);
+    signal.addEventListener("abort", cancel, { once: true });
+    if (signal.aborted) cancel();
+  });
+}
+
+// A listener reports one job's new step: show it wherever the cached state lists that job,
+// without an API call. Finished steps change the conversation document, which refetches.
+function patchStep(state: ConversationState, activity: RunActivity): ConversationState {
+  const step = (s: ProductionStep) =>
+    s.job_id === activity.job_id ? { ...s, status: activity.status, updated_at: activity.updated_at } : s;
+  const p = state.production;
+  return {
+    ...state,
+    operations: state.operations?.map(j => (j.job_id === activity.job_id ? { ...j, status: activity.status } : j)),
+    production: p && {
+      ...p,
+      scenes: p.scenes.map(s => ({ ...s, frame: step(s.frame), video: step(s.video), generation: step(s.generation) })),
+      music: step(p.music),
+      music_generation: step(p.music_generation),
+      composition: step(p.composition),
+      draft: step(p.draft),
+      export: step(p.export),
+    },
+  };
+}
 
 function useWorkspaceState(
   projectId: string,
@@ -27,73 +59,108 @@ function useWorkspaceState(
 ) {
   const base = projectRoot(projectId);
   const client = useQueryClient();
-  const s = useStudio();
+  const s = useEditor();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [accessError, setAccessError] = useState<ApiError | null>(null);
   const [notice, setNotice] = useState("");
   const [head, setHead] = useState<string | null>(null);
   const loaded = useRef<string | null>(null);
   const scope = conversationId
     ? `?conversation_id=${encodeURIComponent(conversationId)}`
     : "";
+  const [resourcesOpen, setResourcesOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const progress = useRef({ key: "", unchanged: 0 });
+  const saveObserver = useRef<AbortController | null>(null);
+  const pendingSaveKey = ["pending-save", user.uid, projectId, conversationId];
   const query = useQuery({
-    queryKey: ["studio", user.uid, projectId, conversationId],
-    queryFn: async () =>
-      (await call(`${base}/studio${scope}`)).data as StudioState,
-    retry: (count, error) =>
-      !(error instanceof ApiError && error.status === 429) && count < 1,
-    refetchInterval: (query) =>
-      query.state.error instanceof ApiError && query.state.error.status === 429
-        ? false
-        : query.state.data?.jobs.some(
-              (job) =>
-                ![
-                  "succeeded",
-                  "failed",
-                  "cancelled",
-                  "submission_unknown",
-                ].includes(job.status),
-            )
-          ? 15000
-          : false,
+    queryKey: ["workspace", user.uid, projectId, conversationId],
+    enabled: !accessError,
+    queryFn: async ({ signal }) => (await call(`${base}/studio${scope}${scope ? "&" : "?"}include_history=false&include_assets=false`, { signal })).data as StudioState,
   });
+  const resources = useQuery({
+    queryKey: ["studio", user.uid, projectId, conversationId],
+    queryFn: async ({ signal }) => (await call(`${base}/studio${scope}`, { signal })).data as StudioState,
+    enabled: resourcesOpen && !accessError,
+  });
+  const conversationKey = ["conversation", user.uid, projectId, conversationId];
+  // True while the Firestore listeners below are connected; polling is then only a safety net.
+  const [live, setLive] = useState(false);
+  const conversationQuery = useQuery({
+    queryKey: conversationKey,
+    enabled: !!conversationId && !accessError,
+    queryFn: async ({ signal }) => {
+      // After the first load, fetch only messages written since the revision already held.
+      const previous = client.getQueryData<ConversationState>(conversationKey);
+      const since = previous?.revision !== undefined ? `&since=${previous.revision}` : "";
+      let data = (await call(`${base}/conversations/${conversationId}?tail=true${since}`, { signal })).data as ConversationState;
+      if (data.incremental && previous) {
+        const merged = new Map(previous.messages.map(m => [m.id, m]));
+        for (const message of data.messages) merged.set(message.id, message);
+        data = { ...data, messages: [...merged.values()].sort((a, b) => a.sequence - b.sequence), next_cursor: previous.next_cursor };
+      }
+      const key = progressKey(data);
+      progress.current = { key, unchanged: key === progress.current.key ? progress.current.unchanged + 1 : 0 };
+      return data;
+    },
+    refetchInterval: q => {
+      if (saving) return false;
+      const delay = pollDelay(q.state.error, q.state.errorUpdatedAt, conversationIsActive(q.state.data), progress.current.unchanged);
+      return live && delay !== false ? Math.max(delay, 120000) : delay;
+    },
+  });
+  const activeRunId = conversationQuery.data?.run?.run_id;
   useEffect(() => {
-    // The first snapshot repeats the initial fetch, and a single job transition can
-    // fire several snapshots, so skip the first and refetch at most once a second.
-    let first = true;
-    const refetch = throttle(() => {
-      void client.invalidateQueries({
-        queryKey: ["studio", user.uid, projectId, conversationId],
-        exact: true,
-      });
-      void client.invalidateQueries({
-        queryKey: ["conversations", user.uid, projectId],
-      });
-    }, 1000);
-    const unsubscribe = subscribeRunSummaries(projectId, () => {
-      if (first) first = false;
-      else refetch();
-    });
+    setLive(false);
+    if (!conversationId || accessError) return;
+    // Two single-document listeners, one read per change: the conversation document changes when
+    // messages, heads or the run's state change; the run's activity document carries each job step.
+    const refetch = throttle(() => void client.invalidateQueries({ queryKey: conversationKey, exact: true }), 2000);
+    const unsubscribeChat = subscribeConversation(projectId, conversationId, refetch, setLive);
+    const unsubscribeRun = activeRunId
+      ? subscribeRunActivity(projectId, activeRunId, activity =>
+          client.setQueryData<ConversationState>(conversationKey, current => current && patchStep(current, activity)))
+      : () => {};
     return () => {
       refetch.cancel();
-      unsubscribe();
+      unsubscribeChat();
+      unsubscribeRun();
     };
-  }, [projectId, user.uid, client, conversationId]);
+  }, [projectId, user.uid, conversationId, activeRunId, accessError, client]);
+  const data = query.data && !accessError ? {
+    ...query.data,
+    assets: resources.data?.assets || query.data.assets,
+    runs: resources.data?.runs || query.data.runs,
+    jobs: resources.data?.jobs || query.data.jobs,
+    events: resources.data?.events || query.data.events,
+    approvals: conversationQuery.data?.approvals || resources.data?.approvals || query.data.approvals,
+    project: { ...query.data.project, composition_head: conversationQuery.data?.conversation.composition_head ?? query.data.project.composition_head },
+  } : undefined;
   useEffect(() => {
     loaded.current = null;
+    progress.current = { key: "", unchanged: 0 };
+    setResourcesOpen(false);
     setHead(null);
     s.reset();
     setError("");
+    setAccessError(null);
     setNotice("");
+  }, [projectId, user.uid, conversationId]);
+  useEffect(() => {
+    const pending = client.getQueryData<PendingSave>(pendingSaveKey);
+    if (pending) void action(() => observeSave(pending));
+    return () => saveObserver.current?.abort();
   }, [projectId, user.uid, conversationId]);
   useEffect(() => () => useStudio.getState().reset(), [projectId, user.uid]);
   useEffect(() => {
     let active = true;
-    const current = query.data?.project.composition_head;
+    const current = data?.project.composition_head;
     if (!current || current === loaded.current || s.dirty) return;
-    void call(
-      `${base}/compositions?artifact_id=${encodeURIComponent(current)}${conversationId ? `&conversation_id=${conversationId}` : ""}`,
-    )
+    void client.fetchQuery({
+      queryKey: ["composition", user.uid, projectId, current], staleTime: Infinity,
+      queryFn: ({ signal }) => call(`${base}/compositions?artifact_id=${encodeURIComponent(current)}${conversationId ? `&conversation_id=${conversationId}` : ""}`, { signal }),
+    })
       .then((response) => {
         if (active) {
           loaded.current = current;
@@ -108,34 +175,52 @@ function useWorkspaceState(
     return () => {
       active = false;
     };
-  }, [query.data?.project.composition_head, s.dirty, base, conversationId]);
+  }, [data?.project.composition_head, s.dirty, base, conversationId, client, user.uid, projectId]);
   useEffect(() => {
-    if (query.isError) {
+    if ([query.error, conversationQuery.error, resources.error].some(e => e instanceof ApiError && [401, 403].includes(e.status))) {
       s.reset();
       setHead(null);
+      clearMediaCache();
+      const denied = [query.error, conversationQuery.error, resources.error].find(e => e instanceof ApiError && [401,403].includes(e.status)) as ApiError;
+      setAccessError(denied);
+      client.removeQueries({ queryKey: ["composition", user.uid, projectId] });
     }
-  }, [query.isError]);
+  }, [query.error, conversationQuery.error, resources.error, client, user.uid, projectId]);
 
-  async function refresh() {
+  const completed = conversationQuery.data?.operations?.filter(j => ["succeeded", "failed", "cancelled"].includes(j.status)).map(j => j.job_id).sort().join("|");
+  const lastCompleted = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (lastCompleted.current !== undefined && completed !== lastCompleted.current) {
+      void client.invalidateQueries({ queryKey: ["workspace", user.uid, projectId] });
+      void client.invalidateQueries({ queryKey: ["studio", user.uid, projectId] });
+    }
+    lastCompleted.current = completed;
+  }, [completed, user.uid, projectId, client]);
+  async function refresh(includeResources = true) {
     await Promise.all([
-      query.refetch(),
+      conversationId ? conversationQuery.refetch() : query.refetch(),
+      includeResources && client.invalidateQueries({ queryKey: ["workspace", user.uid, projectId] }),
+      includeResources && client.invalidateQueries({ queryKey: ["studio", user.uid, projectId] }),
       client.invalidateQueries({ queryKey: ["assets", user.uid, projectId] }),
       client.invalidateQueries({
         queryKey: ["conversations", user.uid, projectId],
       }),
     ]);
   }
-  async function action(task: () => Promise<unknown>) {
+  async function action(task: () => Promise<unknown>, includeResources = false) {
     setBusy(true);
     setError("");
     setNotice("");
     try {
       await track(async () => {
         await task();
-        await refresh();
+        await refresh(includeResources);
       });
     } catch (e) {
-      setError((e as Error).message);
+      if (e instanceof ApiError && [401,403].includes(e.status)) {
+        setAccessError(e); clearMediaCache(); s.reset(); setHead(null);
+      }
+      if ((e as Error).name !== "AbortError") setError((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -152,54 +237,59 @@ function useWorkspaceState(
     });
   }
   async function save() {
-    const submitted = JSON.stringify(s.timeline);
-    const result = await submit("/compositions", {
-      ...s.timeline,
-      expected_head: head,
-    });
-    setNotice("Saving your revision…");
-    for (let i = 0; i < 60; i++) {
-      const job = await call(`${base}/jobs/${result.job_id}`);
-      if (job.status === "succeeded") {
-        const current = await call(
-          `${base}/compositions?artifact_id=${job.artifact_ids[0]}`,
-        );
-        loaded.current = job.artifact_ids[0];
-        setHead(job.artifact_ids[0]);
+    const existing = client.getQueryData<PendingSave>(pendingSaveKey);
+    if (existing) return observeSave(existing);
+    const timeline = useStudio.getState().timeline;
+    const result = await submit("/compositions", { ...timeline, expected_head: head });
+    const pending = { jobId: result.job_id, submitted: JSON.stringify(timeline), started: Date.now() };
+    client.setQueryDefaults(pendingSaveKey, { gcTime: Infinity });
+    client.setQueryData(pendingSaveKey, pending);
+    return observeSave(pending);
+  }
+  async function observeSave(pending: PendingSave) {
+    saveObserver.current?.abort();
+    const observer = new AbortController();
+    saveObserver.current = observer;
+    const signal = observer.signal;
+    setNotice("Saving your revision…"); setSaving(true);
+    const delays = [2000, 5000, 10000, 20000, 30000];
+    let retryDelay = 0;
+    try {
+      for (let i = 0; ; i++) {
+        await wait(Math.max(retryDelay, delays[Math.min(i, delays.length - 1)]), signal);
+        retryDelay = 0;
+        if (document.hidden || !navigator.onLine) continue;
+        if (Date.now() - pending.started > 60000) setNotice("Your save is still processing. Your edits are safe while we wait.");
+        let job;
+        try { job = await call(`${base}/jobs/${pending.jobId}`, { signal }); }
+        catch (error) {
+          if (error instanceof ApiError && [401, 403, 404].includes(error.status)) throw error;
+          if (signal.aborted) throw error;
+          retryDelay = error instanceof ApiError ? error.retryAfterMs || 60000 : 60000;
+          setNotice("Waiting to reconnect. Your save is still processing.");
+          continue;
+        }
+        if (["failed", "cancelled", "submission_unknown"].includes(job.status)) {
+          client.removeQueries({ queryKey: pendingSaveKey, exact: true });
+          throw new Error(job.error?.message || "Revision could not be saved.");
+        }
+        if (job.status !== "succeeded") continue;
+        const artifactId = job.artifact_ids[0];
+        const current = await client.fetchQuery({ queryKey: ["composition", user.uid, projectId, artifactId], staleTime: Infinity,
+          queryFn: () => call(`${base}/compositions?artifact_id=${artifactId}`, { signal }) });
+        signal.throwIfAborted();
+        loaded.current = artifactId; setHead(artifactId);
         const editing = useStudio.getState();
-        const changedWhileSaving =
-          JSON.stringify(editing.timeline) !== submitted;
-        if (changedWhileSaving)
-          editing.edit({
-            ...editing.timeline,
-            expected_head: job.artifact_ids[0],
-          });
-        else
-          editing.load({
-            ...current.data.manifest.timeline,
-            expected_head: job.artifact_ids[0],
-          });
-        await call(
-          `${base}/compositions/${job.artifact_ids[0]}/review${scope}`,
-          {
-            method: "POST",
-            body: JSON.stringify({ idempotency_key: operationKey() }),
-          },
-        );
-        setNotice(
-          changedWhileSaving
-            ? "Saved the submitted version. Your newer edits are still unsaved."
-            : "Saved. Review the new preview before exporting.",
-        );
+        const changedWhileSaving = editing.dirty && JSON.stringify(editing.timeline) !== pending.submitted;
+        if (changedWhileSaving) editing.edit({ ...editing.timeline, expected_head: artifactId });
+        else editing.load({ ...current.data.manifest.timeline, expected_head: artifactId });
+        client.removeQueries({ queryKey: pendingSaveKey, exact: true });
+        setNotice(changedWhileSaving ? "Saved the submitted version. Your newer edits are still unsaved." : "Saved. Review the new preview before exporting.");
         return;
       }
-      if (["failed", "cancelled", "submission_unknown"].includes(job.status))
-        throw new Error(job.error?.message || "Revision could not be saved.");
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } finally {
+      if (saveObserver.current === observer) setSaving(false);
     }
-    throw new Error(
-      "The save is still processing. Keep this video open until it finishes.",
-    );
   }
   async function importAsset(file: File): Promise<Asset> {
     const mime =
@@ -276,8 +366,10 @@ function useWorkspaceState(
   }
   return {
     ...query,
-    queryError: query.error,
-    data: query.data,
+    queryError: accessError || query.error || resources.error,
+    data,
+    conversationQuery: accessError ? { ...conversationQuery, data: undefined, error: accessError } : conversationQuery,
+    loadResources: () => { setResourcesOpen(true); return () => setResourcesOpen(false); },
     projectId,
     user,
     conversationId,

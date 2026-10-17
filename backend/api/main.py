@@ -12,6 +12,7 @@ from pydantic import Field
 from vibeshorts_mcp.server import build_server, http_app
 
 from execution.dispatch import Dispatcher, PubSubPublisher, Reconciler, handle
+from execution.read_context import read_scope
 from execution.runtime import Runtime
 from execution.telemetry import metrics
 from tools.contracts.errors import AppError
@@ -107,8 +108,15 @@ def create_app(runtime=None):
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
-        expose_headers=["WWW-Authenticate", "MCP-Session-Id", "MCP-Protocol-Version"],
+        expose_headers=["WWW-Authenticate", "MCP-Session-Id", "MCP-Protocol-Version", "Retry-After"],
     )
+
+    @app.middleware("http")
+    async def cache_read_request(request, call_next):
+        if request.method == "GET" and request.url.path.startswith(("/v1/", "/oauth/requests/")):
+            with read_scope():
+                return await call_next(request)
+        return await call_next(request)
 
     @app.exception_handler(AppError)
     async def app_error(request, exc):

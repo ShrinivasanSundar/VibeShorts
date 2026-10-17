@@ -1,7 +1,10 @@
 """Project-owned conversations. Jobs remain authoritative for execution and media."""
 
+import base64
 import hashlib
+import json
 
+from execution.read_context import read_command
 from tools.contracts.errors import AppError
 from tools.contracts.models import CANCEL, GENERATE, Caller, DataResult
 from tools.contracts.studio import (
@@ -208,19 +211,49 @@ class ConversationCommands:
 
         return DataResult(data=self.repo.atomic(apply))
 
+    @read_command
     def list_conversations(self, caller, project, limit=30, cursor=None):
         from tools.commands import project_path
 
         self.authorize(caller, project)
-        docs = self.repo.latest(project_path(project, "conversations"), "updated_at", limit + 1, cursor or "")
-        more, docs = len(docs) > limit, docs[:limit]
-        return DataResult(
-            data={
-                "conversations": [d for d in docs if not d.get("deleting")],
-                "next_cursor": docs[-1]["id"] if more else None,
-            }
-        )
+        collection = project_path(project, "conversations")
+        after = None
+        if cursor:
+            if cursor.startswith("v2:"):
+                try:
+                    value = json.loads(base64.urlsafe_b64decode(cursor[3:]))
+                    if value["project"] != project or not isinstance(value["updated_at"], (float, int)):
+                        raise ValueError("Cursor scope mismatch")
+                    from tools.commands import checked_id
 
+                    after = {"updated_at": value["updated_at"], "__name__": checked_id(value["id"])}
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise AppError("INVALID_INPUT", "Invalid conversation cursor") from exc
+            else:
+                from tools.commands import checked_id
+
+                old = self.repo.get(collection + "/" + checked_id(cursor))
+                if not old:
+                    return DataResult(data={"conversations": [], "next_cursor": None})
+                after = {"updated_at": old["updated_at"], "__name__": old["id"]}
+        docs = self.repo.query(
+            collection, order=[("updated_at", True), ("__name__", True)], limit=limit + 1, after=after
+        )
+        page = docs[:limit]
+        next_cursor = None
+        if len(docs) > limit:
+            next_cursor = (
+                "v2:"
+                + base64.urlsafe_b64encode(
+                    json.dumps(
+                        {"project": project, "updated_at": page[-1]["updated_at"], "id": page[-1]["id"]}
+                    ).encode()
+                ).decode()
+            )
+        conversations = [d for d in page if not d.get("deleting")]
+        return DataResult(data={"conversations": conversations, "next_cursor": next_cursor})
+
+    @read_command
     def conversation_state(
         self, caller, project, conversation, cursor=None, limit=50, tail=False, since=None
     ):
@@ -241,12 +274,43 @@ class ConversationCommands:
                 path + "/messages", limit + 1, cursor or ""
             )
             page = list(reversed(messages[:limit])) if tail else messages[:limit]
+        pending = self.repo.query(
+            path + "/messages", filters=[("status", "in", ["queued", "running"])], limit=1
+        )
+        recent_jobs = self.repo.query(
+            project_path(project, "jobs"),
+            filters=[("conversation_id", "==", conversation)],
+            order=[("created_at", True)],
+            limit=15,
+        )
+        active_jobs = self.repo.query(
+            project_path(project, "jobs"),
+            filters=[
+                ("conversation_id", "==", conversation),
+                (
+                    "status",
+                    "in",
+                    [
+                        "queued",
+                        "claimed",
+                        "submitting",
+                        "waiting_for_provider",
+                        "materializing",
+                        "cancel_requested",
+                    ],
+                ),
+            ],
+            order=[("created_at", True)],
+            limit=60,
+        )
+        operations = {j["job_id"]: j for j in [*recent_jobs, *active_jobs]}
         run = self._load_run(project, doc["active_run_id"]).model_dump() if doc["active_run_id"] else None
         return DataResult(
             data={
                 "revision": doc.get("revision", 0),
                 "incremental": incremental,
                 "conversation": doc,
+                "has_pending_message": bool(pending),
                 "production": self.production_summary(caller, project, doc, run),
                 "messages": [{k: v for k, v in m.items() if k not in {"caller", "request"}} for m in page],
                 "run": run,
@@ -259,10 +323,14 @@ class ConversationCommands:
                         "error": j.get("error"),
                         "retried_by": j.get("retried_by"),
                     }
-                    for j in self.repo.recent_where(
-                        project_path(project, "jobs"), "conversation_id", conversation, 15
-                    )
+                    for j in operations.values()
                 ],
+                "approvals": self.repo.query(
+                    project_path(project, "approvals"),
+                    filters=[("conversation_id", "==", conversation), ("decision", "==", "pending")],
+                    order=[("created_at", True)],
+                    limit=20,
+                ),
                 "next_cursor": messages[limit - 1]["id"] if len(messages) > limit else None,
             }
         )
@@ -657,8 +725,11 @@ class ConversationScheduler:
                 pending = next(
                     (
                         m
-                        for m in c.repo.list(path + "/messages")
-                        if m.get("status") in {"queued", "running", "needs_reconciliation"}
+                        for m in c.repo.query(
+                            path + "/messages",
+                            filters=[("status", "in", ["queued", "running", "needs_reconciliation"])],
+                            limit=1,
+                        )
                     ),
                     None,
                 )
@@ -707,7 +778,15 @@ class ConversationScheduler:
 
         c = self.c
         path = conversation_path(project, doc["id"])
-        messages = sorted(c.repo.list(path + "/messages"), key=lambda m: m["sequence"])
+        pending_messages = c.repo.query(
+            path + "/messages",
+            filters=[("status", "in", ["queued", "running", "needs_reconciliation"])],
+            order=[("sequence", False)],
+            limit=1,
+        )
+        messages = list(reversed(c.repo.tail(path + "/messages", 12)))
+        if pending_messages and not any(m["id"] == pending_messages[0]["id"] for m in messages):
+            messages.insert(0, pending_messages[0])
         active = (
             c.repo.get(project_path(project, "runs", doc["active_run_id"])) if doc["active_run_id"] else None
         )
@@ -721,11 +800,14 @@ class ConversationScheduler:
                 if current["active_run_id"] == active["run_id"]:
                     current.update(synced_run_id=active["run_id"], synced_run_version=active["version"])
                     tx.set(path, current)
+                summary_path = project_path(project, "run_summaries", active["run_id"])
+                summary = tx.get(summary_path)
+                if summary and summary.get("version") == active["version"]:
+                    summary["sync_pending"] = False
+                    tx.set(summary_path, summary)
 
             c.repo.atomic(remember)
-        pending = next(
-            (m for m in messages if m.get("status") in {"queued", "running", "needs_reconciliation"}), None
-        )
+        pending = next(iter(pending_messages), None)
         if not pending:
             return
         caller = Caller(**pending["caller"])
@@ -734,7 +816,25 @@ class ConversationScheduler:
         except AppError:
             c.repo.atomic(lambda tx: set_message(tx, path, {**pending, "status": "cancelled"}))
             return
-        scoped_jobs = c.repo.list_where(project_path(project, "jobs"), "conversation_id", [doc["id"]])
+        scoped_jobs = c.repo.query(
+            project_path(project, "jobs"),
+            filters=[
+                ("conversation_id", "==", doc["id"]),
+                (
+                    "status",
+                    "in",
+                    [
+                        "queued",
+                        "claimed",
+                        "submitting",
+                        "waiting_for_provider",
+                        "materializing",
+                        "cancel_requested",
+                        "submission_unknown",
+                    ],
+                ),
+            ],
+        )
         if any(
             job["job_id"] != pending.get("job_id")
             and (job["status"] not in TERMINAL or job["status"] == "submission_unknown")

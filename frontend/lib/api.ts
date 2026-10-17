@@ -4,7 +4,7 @@ import { track } from "./loading";
 const api = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) {
+  constructor(message: string, public status: number, public retryAfterMs = 0) {
     super(message);
     this.name = "ApiError";
   }
@@ -27,7 +27,9 @@ async function send(path: string, options: RequestInit) {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new ApiError(body.message || body.detail?.[0]?.msg || "The request could not be completed.", response.status);
+    const header = response.headers.get("Retry-After");
+    const retryAfterMs = header ? Math.max(0, /^\d+$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now()) : 0;
+    throw new ApiError(body.message || body.detail?.[0]?.msg || "The request could not be completed.", response.status, Number.isFinite(retryAfterMs) ? retryAfterMs : 0);
   }
   return response;
 }
