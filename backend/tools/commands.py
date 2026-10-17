@@ -58,6 +58,9 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
         self.provider, self.settings, self.clock = provider, settings, clock
         # Set by processes that can publish; without it the scheduled dispatch sends the outbox.
         self.publisher = None
+        from execution.dispatch import RecentlyPublished
+
+        self.recently_published = RecentlyPublished()
 
     def enqueue_advance(self, tx, project_id, target, target_id):
         """Ask for one scheduler pass of a run or conversation; the periodic sweep stays the fallback.
@@ -89,7 +92,7 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
         from execution.dispatch import Dispatcher
 
         try:
-            return Dispatcher(self, self.publisher).dispatch(project_id)
+            return Dispatcher(self, self.publisher, self.recently_published).dispatch(project_id)
         except Exception as exc:
             # The rows are committed; the scheduled dispatch still sends them.
             event("outbox_flush_failure", project_id=project_id, exception_type=type(exc).__name__)
@@ -456,6 +459,8 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
                     "provider": snapshot,
                     "brand_version": brand_version,
                     "trace_id": identifier("trace"),
+                    # Storyboard jobs start a workflow run; children join their parent's.
+                    "in_workflow": kind == "storyboard" or bool(parent and parent.get("workflow")),
                     "created_at": now,
                     "updated_at": now,
                     "generation": 0,
@@ -694,6 +699,14 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
     def transition(self, tx, job, status):
         job["status"], job["updated_at"] = status, self.clock()
         tx.set(project_path(job["project_id"], "jobs", job["job_id"]), job)
+        if job.get("in_workflow") and status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "submission_unknown",
+        }:
+            self._intermediate_transition(tx, job, status)
+            return
         run_path = project_path(job["project_id"], "runs", job["run_id"])
         run = tx.get(run_path)
         run_status = {
@@ -727,6 +740,36 @@ class Commands(StudioCommands, ConversationCommands, DeletionCommands):
                 "run_id": run["run_id"],
                 "job_id": job["job_id"],
                 "sequence": run["version"],
+                "status": status,
+                "created_at": self.clock(),
+                "trace_id": job["trace_id"],
+            },
+        )
+        event("job_transition", job_id=job["job_id"], status=status, trace_id=job["trace_id"])
+
+    def _intermediate_transition(self, tx, job, status):
+        """A workflow job's step that changes nothing about its run.
+
+        A video's jobs run in parallel, and rewriting their shared run record on every
+        claim, submission and poll made their transactions collide and retry. Only blind
+        writes go to shared documents here; the activity document still wakes Studio listeners.
+        """
+        pid, run_id = job["project_id"], job["run_id"]
+        step_path = project_path(pid, "steps", job["step_id"])
+        step = tx.get(step_path)
+        step["status"] = status
+        tx.set(step_path, step)
+        tx.set(
+            project_path(pid, "run_summaries", run_id + "_activity"),
+            {"run_id": run_id, "job_id": job["job_id"], "status": status, "updated_at": self.clock()},
+        )
+        event_id = f"{run_id}_{job['job_id']}_{job['generation']:06d}_{status}"
+        tx.set(
+            project_path(pid, "events", event_id),
+            {
+                "id": event_id,
+                "run_id": run_id,
+                "job_id": job["job_id"],
                 "status": status,
                 "created_at": self.clock(),
                 "trace_id": job["trace_id"],

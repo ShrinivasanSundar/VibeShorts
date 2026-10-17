@@ -140,6 +140,7 @@ class DeletionCommands:
 
         doomed = [project_path(project, "runs", r) for r in run_ids]
         doomed += [project_path(project, "run_summaries", r) for r in run_ids]
+        doomed += [project_path(project, "run_summaries", r + "_activity") for r in run_ids]
         doomed += [
             project_path(project, "approvals", a["id"])
             for a in self.repo.list(project_path(project, "approvals"))
@@ -150,7 +151,11 @@ class DeletionCommands:
             events = self.repo.list_where(
                 project_path(project, "events"), "run_id", ordered[start : start + 30]
             )
-            doomed += [project_path(project, "events", f"{e['run_id']}_{e['sequence']:012d}") for e in events]
+            # Intermediate job events carry their id; run events are keyed by run version.
+            doomed += [
+                project_path(project, "events", e.get("id") or f"{e['run_id']}_{e['sequence']:012d}")
+                for e in events
+            ]
         for start in range(0, len(doomed), 400):  # Stay below Firestore's 500-write transaction limit.
             self.repo.atomic(lambda tx, chunk=doomed[start : start + 400]: [tx.delete(p) for p in chunk])
         self._erase_sessions(project, run_ids)

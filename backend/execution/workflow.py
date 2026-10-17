@@ -318,7 +318,14 @@ class WorkflowScheduler:
                     sid + ":keyframe",
                     "image",
                     ImageInput(
-                        prompt=visual_prompt,
+                        # Without this, image models treat references as loose inspiration.
+                        prompt=(
+                            "Use the attached reference image(s) as the exact subject: keep its shape, "
+                            "colours, materials, markings and identifying details unchanged. "
+                            if scene["reference_artifact_ids"]
+                            else ""
+                        )
+                        + visual_prompt,
                         aspect_ratio=plan["aspect_ratio"],
                         reference_artifact_ids=scene["reference_artifact_ids"],
                     ),

@@ -1,6 +1,7 @@
 """One resumable ADK Creative Director in a dependency-isolated process."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import sys
@@ -60,6 +61,20 @@ async def main():
         # context once and use the model's native structured-response schema.
         payload["brand_dna"] = get_brand_dna() or {}
     schema = DirectorTurn if chatting else Composition if editing else Storyboard
+    images = payload.pop("reference_images", [])
+    parts = [types.Part(text=json.dumps(payload))]
+    for image in images:
+        parts.append(types.Part(text="Reference image " + image["artifact_id"] + ":"))
+        parts.append(types.Part.from_bytes(data=base64.b64decode(image["data"]), mime_type="image/jpeg"))
+    grounding = (
+        " The user's reference images follow the request, each labelled with its artifact id. "
+        "Look at them: they show the exact subject, product, character or style to use. In every "
+        "scene that shows that subject, describe its real appearance (shape, colours, materials, "
+        "distinguishing details) in visual_prompt and list its artifact id in reference_artifact_ids. "
+        "Keep the story about what the images show."
+        if images
+        else ""
+    )
     director = LlmAgent(
         name="creative_director",
         model=Gemini(model=payload["model"], retry_options=types.HttpRetryOptions(attempts=1)),
@@ -85,13 +100,13 @@ async def main():
             "Use edit_composition and instruction for timeline, sound, or duration edits "
             "after a composition exists. "
             "Never approve, export, invent artifact ids, or call providers. All execution "
-            "goes through application commands."
+            "goes through application commands." + grounding
             if chatting
             else "Edit only the provided typed timeline according to the instruction. "
             "Preserve artifact ids and "
             "Preserve clip settings. Return a valid Composition. Never approve it or replace original media."
             if editing
-            else (BACKEND_ROOT / "skills/product_launch/director.md").read_text()
+            else (BACKEND_ROOT / "skills/product_launch/director.md").read_text() + grounding
         ),
         output_schema=DirectorConversation
         if chatting
@@ -109,7 +124,7 @@ async def main():
     async for event in runner.run_async(
         user_id=payload["uid"],
         session_id=session_id,
-        new_message=types.Content(role="user", parts=[types.Part(text=json.dumps(payload))]),
+        new_message=types.Content(role="user", parts=parts),
         run_config=RunConfig(max_llm_calls=3),
     ):
 

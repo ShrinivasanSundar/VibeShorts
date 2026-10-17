@@ -23,6 +23,17 @@ from tools.media.pipeline import extract, inspect, prepare, run
 LOCAL = {"prepare", "frame", "composition", "render"}
 
 
+def director_image(data):
+    """A small JPEG the director can see. Session events store it, and Firestore caps documents at 1 MiB."""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(data))
+    image.thumbnail((512, 512))
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=80)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
 class StudioProvider:
     def __init__(self, commands, kind):
         self.commands, self.settings, self.kind = commands, commands.settings, kind
@@ -190,7 +201,20 @@ class StudioProvider:
 
         return poll(self.commands, operation)
 
-    def _director(self, request, snapshot, job, composition=None):
+    def reference_images(self, request, job):
+        """Attached images plus those the current storyboard already uses, at most three."""
+        ids = list(request.reference_artifact_ids)
+        story = getattr(request, "context", {}).get("storyboard") or {}
+        for scene in story.get("scenes", []):
+            ids.extend(scene.get("reference_artifact_ids", []))
+        caller = Caller(**job["caller"])
+        images = []
+        for artifact_id in list(dict.fromkeys(ids))[:3]:
+            data, _ = self.commands.asset_content(caller, job["project_id"], artifact_id)
+            images.append({"artifact_id": artifact_id, "data": director_image(data)})
+        return images
+
+    def _director(self, request, snapshot, job, composition=None, images=()):
         payload = {
             "operation": self.kind,
             "request": request.model_dump(),
@@ -205,6 +229,7 @@ class StudioProvider:
             "location": snapshot["location"],
             "cloud_project": self.settings.google_cloud_project,
             "vertex_project": snapshot.get("project") or self.settings.google_cloud_project,
+            "reference_images": list(images),
         }
         env = dict(os.environ)
         if snapshot["route"] == "vertex" and self.settings.vertex_credentials:
@@ -256,7 +281,7 @@ class StudioProvider:
 
                 turn = fixture_turn(request, job["project_id"], job["brand_version"])
             else:
-                turn = self._director(request, snapshot, job)
+                turn = self._director(request, snapshot, job, images=self.reference_images(request, job))
             return ImageOutput(turn.model_dump_json().encode(), "application/json")
         if self.kind == "storyboard":
             if job.get("storyboard_override"):
@@ -300,7 +325,7 @@ class StudioProvider:
                     music=MusicInput(prompt="Instrumental uplifting product launch, no vocals"),
                 )
             else:
-                story = self._director(request, snapshot, job)
+                story = self._director(request, snapshot, job, images=self.reference_images(request, job))
             return ImageOutput(story.model_dump_json().encode(), "application/json")
         if self.kind == "video":
             with tempfile.TemporaryDirectory() as folder:

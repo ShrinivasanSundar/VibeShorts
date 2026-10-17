@@ -32,6 +32,14 @@ const jobLabels: Record<string, string> = {
 };
 const label = (step: ProductionStep) =>
   jobLabels[step.status] || step.status.replaceAll("_", " ");
+// Paid media only starts once the storyboard is approved, so unstarted steps are not stuck.
+const awaitingApproval = (state?: ConversationState) =>
+  state?.run?.approval?.kind === "storyboard" &&
+  state.run.approval.decision === "pending";
+const stepLabel = (step: ProductionStep, state?: ConversationState) =>
+  step.status === "pending" && awaitingApproval(state)
+    ? "Generated after you approve"
+    : label(step);
 const ago = (seconds: number) =>
   seconds < 60
     ? `${seconds}s ago`
@@ -70,7 +78,9 @@ export function ProductionPlan({ state }: { state?: ConversationState }) {
           ? "Checking request" + count
           : steps.some(active)
             ? "In progress" + count
-            : "Waiting" + count;
+            : awaitingApproval(state)
+              ? "After approval"
+              : "Waiting" + count;
   };
   const tracked = [
     ...p.scenes.flatMap((scene, i) => [
@@ -310,7 +320,7 @@ export function ProductionView({
                     ) : (
                       <div className="scene-placeholder">
                         <Clapperboard size={26} />
-                        <span>{label(step)}</span>
+                        <span>{stepLabel(step, state)}</span>
                       </div>
                     )}
                   </div>
@@ -322,7 +332,7 @@ export function ProductionView({
                       ? scene.visual_prompt
                       : scene.exact_copy.join(" · ")}
                   </p>
-                  <small>{label(step)}</small>
+                  <small>{stepLabel(step, state)}</small>
                   {step.error && (
                     <p className="chat-error" role="alert">
                       {step.error.message}

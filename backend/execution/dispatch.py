@@ -1,9 +1,13 @@
 import json
+import threading
 import time
 
 from execution.telemetry import event
 from tools.commands import project_path
 from tools.contracts.errors import AppError
+
+# A queued job is recovered only after this long, so the sweep does not duplicate live dispatches.
+QUEUED_GRACE_SECONDS = 120
 
 
 def live_matches(repo, group, field, values):
@@ -26,9 +30,33 @@ class PubSubPublisher:
         self.client.publish(self.topic, json.dumps(message).encode()).result(timeout=30)
 
 
+class RecentlyPublished:
+    """Outbox row versions this process already sent, so concurrent flushes publish each once.
+
+    Another process may still send a duplicate; job leases and scheduler leases absorb it.
+    """
+
+    def __init__(self, ttl_seconds=120):
+        self.ttl, self.sent, self.lock = ttl_seconds, {}, threading.Lock()
+
+    def reserve(self, key):
+        now = time.monotonic()
+        with self.lock:
+            for old in [k for k, at in self.sent.items() if now - at > self.ttl]:
+                del self.sent[old]
+            if key in self.sent:
+                return False
+            self.sent[key] = now
+            return True
+
+    def release(self, key):
+        with self.lock:
+            self.sent.pop(key, None)
+
+
 class Dispatcher:
-    def __init__(self, commands, publisher):
-        self.commands, self.publisher = commands, publisher
+    def __init__(self, commands, publisher, recent=None):
+        self.commands, self.publisher, self.recent = commands, publisher, recent
 
     def dispatch(self, project_id=None):
         """Publish due outbox rows: every project's, or one project's after it committed new work."""
@@ -50,8 +78,13 @@ class Dispatcher:
                 if item.get("kind") == "advance"
                 else {"job_id": item["job_id"]}
             )
+            key = (project_id, item["id"], item["next_attempt_at"], item.get("nonce"))
+            if self.recent and not self.recent.reserve(key):
+                continue  # Another thread of this process is sending, or already sent, this row.
+            published = False
             try:
                 self.publisher.publish({"project_id": project_id, **fields})
+                published = True
 
                 def mark(tx, project_id=project_id, item=item):
                     path = project_path(project_id, "outbox", item["id"])
@@ -73,6 +106,8 @@ class Dispatcher:
                     queue_age_seconds=self.commands.clock() - item["created_at"],
                 )
             except Exception:
+                if self.recent and not published:
+                    self.recent.release(key)
 
                 def retry(tx, project_id=project_id, item=item):
                     path = project_path(project_id, "outbox", item["id"])
@@ -143,6 +178,11 @@ class Reconciler:
                 continue
             if job["lease_owner"] and job["lease_expires_at"] > self.commands.clock():
                 continue
+            if (
+                job["status"] == "queued"
+                and self.commands.clock() - job.get("updated_at", 0) < QUEUED_GRACE_SECONDS
+            ):
+                continue  # Its dispatch is likely in flight; re-queueing now only publishes a duplicate.
             candidate = self.commands.storage.get(job["candidate_path"]) if job["candidate_path"] else None
             from execution.director_recovery import recover_director_failure
 
@@ -230,6 +270,9 @@ class Reconciler:
 class EmulatorPump:
     """A local dispatcher/subscriber; Firestore and Pub/Sub still own durable work."""
 
+    # Jobs handled at once. Each may hold an FFmpeg process or a 4 GB Docker render.
+    CONCURRENCY = 6
+
     def __init__(self, commands, worker):
         from google.cloud import pubsub_v1
 
@@ -241,7 +284,7 @@ class EmulatorPump:
             commands.settings.google_cloud_project,
             "vibeshorts-local-live" if commands.settings.local_live else "vibeshorts-local",
         )
-        self.dispatcher = Dispatcher(commands, self.publisher)
+        self.dispatcher = Dispatcher(commands, self.publisher, commands.recently_published)
         self.reconciler = Reconciler(commands)
 
     def bootstrap(self):
@@ -258,7 +301,7 @@ class EmulatorPump:
         except AlreadyExists:
             pass
 
-    def once(self, *, sweep_workflows=True, dispatch=True):
+    def once(self, *, sweep_workflows=True, dispatch=True, wait=True):
         from execution.workflow import WorkflowScheduler
 
         if sweep_workflows:
@@ -267,22 +310,51 @@ class EmulatorPump:
 
         if dispatch:
             self.dispatcher.dispatch()
+        # Jobs run concurrently, as Cloud Run push delivery does; leases fence duplicate work.
+        if getattr(self, "pool", None) is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.pool = ThreadPoolExecutor(max_workers=self.CONCURRENCY, thread_name_prefix="vibeshorts-job")
+            self.in_flight = set()
+        self.in_flight = {future for future in self.in_flight if not future.done()}
+        free = self.CONCURRENCY - len(self.in_flight)
+        if free <= 0:
+            return
         try:
             response = self.subscriber.pull(
-                request={"subscription": self.subscription, "max_messages": 10}, timeout=2
+                request={"subscription": self.subscription, "max_messages": min(10, free)}, timeout=2
             )
         except DeadlineExceeded:
             return
-        for message in response.received_messages:
-            try:
-                handle(self.commands, self.worker, json.loads(message.message.data))
-            except AppError as exc:
-                if exc.payload.code != "SCHEDULER_BUSY":
-                    raise
-                continue  # Unacknowledged: redelivered after the subscription's ack deadline.
-            self.subscriber.acknowledge(
-                request={"subscription": self.subscription, "ack_ids": [message.ack_id]}
-            )
+        messages = list(response.received_messages)
+        if not messages:
+            return
+        # Long steps (composition, renders) outlast the subscription's default ack deadline.
+        self._ack_deadline([m.ack_id for m in messages], 600)
+        futures = [self.pool.submit(self._process, message) for message in messages]
+        self.in_flight.update(futures)
+        if wait:
+            for future in futures:
+                future.result()
+
+    def _ack_deadline(self, ack_ids, seconds):
+        self.subscriber.modify_ack_deadline(
+            request={"subscription": self.subscription, "ack_ids": ack_ids, "ack_deadline_seconds": seconds}
+        )
+
+    def _process(self, message):
+        try:
+            handle(self.commands, self.worker, json.loads(message.message.data))
+        except Exception as exc:
+            busy = isinstance(exc, AppError) and exc.payload.code == "SCHEDULER_BUSY"
+            if not busy:
+                event("worker_message_failed", exception_type=type(exc).__name__, error=str(exc)[-500:])
+            # Unacknowledged with a short deadline: redelivered soon without spinning.
+            self._ack_deadline([message.ack_id], 10 if busy else 30)
+            if not busy:
+                raise
+            return
+        self.subscriber.acknowledge(request={"subscription": self.subscription, "ack_ids": [message.ack_id]})
 
     def run(self):
         self.bootstrap()
@@ -307,7 +379,8 @@ class EmulatorPump:
                     next_scan = time.time() + interval
                 # Locally against live Firestore, the minute reconcile already sweeps workflows.
                 sweep_workflows = scan and not reconciled and not settings.local_live
-                self.once(sweep_workflows=sweep_workflows, dispatch=scan)
+                # Pulling continues while earlier jobs run, up to the pool's capacity.
+                self.once(sweep_workflows=sweep_workflows, dispatch=scan, wait=False)
             except ResourceExhausted as exc:
                 event("worker_quota_exhausted", operation=operation, error=str(exc), retry_after_seconds=60)
                 time.sleep(60)

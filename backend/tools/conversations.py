@@ -45,6 +45,22 @@ def conversation_request_value(body):
     return value
 
 
+def ground_references(plan, attachments):
+    """Keep images the user just attached when the director's plan uses none of them.
+
+    Scenes without continuity get them first, within the three-reference limit; continuity
+    scenes start from the previous scene's frame, which already carries the subject.
+    """
+    used = {aid for scene in plan.scenes for aid in scene.reference_artifact_ids}
+    if not attachments or used & set(attachments):
+        return plan
+    for scene in plan.scenes:
+        if not scene.continuity_from_scene_id:
+            merged = dict.fromkeys([*attachments, *scene.reference_artifact_ids])
+            scene.reference_artifact_ids = list(merged)[:3]
+    return plan
+
+
 def append_message(commands, tx, project, conversation, source, role, text, blocks=None, **extra):
     path = conversation_path(project, conversation)
     marker = path + "/message_keys/" + hashlib.sha256(source.encode()).hexdigest()
@@ -836,6 +852,7 @@ class ConversationScheduler:
             plan = turn.storyboard
             if plan.project_id != project:
                 raise AppError("INVALID_INPUT", "Director changed the project")
+            ground_references(plan, message["request"].get("reference_artifact_ids", []))
             return self.revise_plan(caller, project, doc, message, plan, active)
         if turn.action == "edit_composition":
             if not doc["composition_head"]:
