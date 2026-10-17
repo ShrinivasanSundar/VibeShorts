@@ -817,20 +817,21 @@ export function ChatWorkspace({
                 >
                   <Check size={18} />
                   <div>
-                    <strong>
-                      {approval.kind === "storyboard"
-                        ? "Ready to create your video?"
-                        : approval.kind === "scene"
-                          ? "How does this scene look?"
-                          : "Ready to export this version?"}
-                    </strong>
-                    <p>
-                      {approval.kind === "storyboard"
-                        ? "Approve this storyboard to start production."
-                        : approval.kind === "scene"
-                          ? "Continue when you’re happy, or tell me what to change."
-                          : "Approve the exact current video before final export."}
-                    </p>
+                    <strong>{reviewCopy(approval.kind).title}</strong>
+                    <p>{reviewCopy(approval.kind).body}</p>
+                    {!!approval.artifact_ids?.length && (
+                      <div className="chat-review-grid">
+                        {approval.artifact_ids.map((id, index) => (
+                          <PrivateMedia
+                            key={id}
+                            projectId={w.projectId}
+                            artifactId={id}
+                            image
+                            title={`${approval.kind === "assets" ? "Asset" : "Keyframe"} ${index + 1}`}
+                          />
+                        ))}
+                      </div>
+                    )}
                     <div className="chat-card-actions">
                       <button
                         className="chat-button primary"
@@ -845,11 +846,7 @@ export function ChatWorkspace({
                           void accept(approval.id, approval.target_artifact_id)
                         }
                       >
-                        {approval.kind === "storyboard"
-                          ? "Approve and create video"
-                          : approval.kind === "scene"
-                            ? "Continue"
-                            : "Approve and export"}
+                        {reviewCopy(approval.kind).action}
                       </button>
                       <button
                         className="chat-button"
@@ -1556,4 +1553,36 @@ function StyleDrawer({
       </section>
     </div>
   );
+}
+
+function reviewCopy(kind: string) {
+  if (kind === "storyboard")
+    return {
+      title: "Ready to create your video?",
+      body: "Approve this storyboard to start production.",
+      action: "Approve and create video",
+    };
+  if (kind === "assets")
+    return {
+      title: "Do these assets look right?",
+      body: "Every scene is built from these images. Approve them, or tell me what to change.",
+      action: "Approve assets",
+    };
+  if (kind === "keyframes")
+    return {
+      title: "Happy with the scene frames?",
+      body: "Videos are generated from these frames. Approve to start the videos.",
+      action: "Approve and create videos",
+    };
+  if (kind === "scene")
+    return {
+      title: "How does this scene look?",
+      body: "Continue when you’re happy, or tell me what to change.",
+      action: "Continue",
+    };
+  return {
+    title: "Ready to export this version?",
+    body: "Approve the exact current video before final export.",
+    action: "Approve and export",
+  };
 }

@@ -77,7 +77,7 @@ class VertexImageProvider:
             "api_version": "v1beta" if self.settings.provider == "developer" else "v1",
             "profile_version": "vertex-image-v1",
             "verified_at": "2026-10-03",
-            "launch_stage": "GA",
+            "launch_stage": "preview" if "preview" in self.settings.image_model else "GA",
             "deprecated": self.settings.image_model == "gemini-2.5-flash-image",
             "rate": rate,
             "reservation_micros": estimate,
@@ -131,7 +131,7 @@ class VertexImageProvider:
                 for c in candidates
                 if c.content
                 for p in (c.content.parts or [])
-                if p.inline_data and p.inline_data.mime_type.startswith("image/")
+                if p.inline_data and p.inline_data.mime_type.startswith("image/") and not p.thought
             ]
             if len(parts) != 1:
                 raise ProviderFailure(

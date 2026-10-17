@@ -205,8 +205,8 @@ class StudioProvider:
         """Attached images plus those the current storyboard already uses, at most three."""
         ids = list(request.reference_artifact_ids)
         story = getattr(request, "context", {}).get("storyboard") or {}
-        for scene in story.get("scenes", []):
-            ids.extend(scene.get("reference_artifact_ids", []))
+        for item in [*story.get("assets", []), *story.get("scenes", [])]:
+            ids.extend(item.get("reference_artifact_ids", []))
         caller = Caller(**job["caller"])
         images = []
         for artifact_id in list(dict.fromkeys(ids))[:3]:

@@ -92,6 +92,10 @@ async function createVideo(page: Page) {
   await page
     .getByRole("button", { name: "Approve and create video", exact: true })
     .click();
+  await expect(page.getByLabel("Keyframe 1")).toBeVisible();
+  await page
+    .getByRole("button", { name: "Approve and create videos", exact: true })
+    .click();
   await expect(page.getByLabel("Combined video preview")).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Continue", exact: true }),

@@ -88,7 +88,8 @@ Example brief:
 
 1. Verify the signed-in user and project access; snapshot the brief, skill version, brand version, and spend cap.
 2. The director produces a typed storyboard. Validate it and request approval of that exact storyboard revision.
-3. On approval, create dependent production jobs. Each scene gets a keyframe, then a video plate. Independent scenes may overlap; continuity introduces explicit dependencies.
+3. On approval, generate the storyboard's 1–3 reusable assets (main subject or character, location, style frame) and request their approval. Every scene is drawn from these same images, which keeps the clips consistent.
+   Then generate every scene keyframe with its assets as reference images and request keyframe approval before any paid video. Each approved keyframe becomes the first frame of a video plate. Continuity scenes start from the previous plate's last frame.
 4. Generate instrumental music alongside the video jobs.
 5. Inspect and prepare the media: dimensions, trim points, frame rate, audio, and any continuity frames.
 6. Produce an immutable HyperFrames package using prepared media, exact brand assets, type, and seekable motion.
@@ -686,10 +687,12 @@ A draft render is validation work; it does not imply approval for final export. 
 
 ## Approvals and quality checks
 
-### Two version-bound gates
+### Version-bound gates
 
 1. **Storyboard approval:** authorizes the production plan and its snapshotted spend allowance before paid media generation.
-2. **Preview approval:** authorizes final export of the exact reviewed composition package.
+2. **Asset approval:** confirms the reference images every scene is built from (skipped when the storyboard defines no assets).
+3. **Keyframe approval:** confirms each scene's first frame before video generation.
+4. **Preview approval:** authorizes final export of the exact reviewed composition package.
 
 Store approval id, type, target revision, reviewer UID, decision, timestamp, and accepted budget/version. The approval API verifies current permissions and expected target, commits the decision plus resume outbox entry transactionally, and rejects duplicate/conflicting decisions appropriately. Editing the relevant target invalidates its approval.
 

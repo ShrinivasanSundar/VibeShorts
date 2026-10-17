@@ -22,7 +22,7 @@ spec:
             - {name: VIBESHORTS_BUCKET, value: YOUR_PRIVATE_BUCKET}
             - {name: VIBESHORTS_PROVIDER, value: vertex}
             - {name: VIBESHORTS_GOOGLE_LOCATION, value: global}
-            - {name: VIBESHORTS_IMAGE_MODEL, value: gemini-2.5-flash-image}
+            - {name: VIBESHORTS_IMAGE_MODEL, value: gemini-3-pro-image-preview}
             - {name: VIBESHORTS_RENDER_RUNNER, value: cloud_run}
             - {name: VIBESHORTS_RENDER_CLOUD_JOB, value: projects/YOUR_PROJECT/locations/YOUR_REGION/jobs/vibeshorts-render}
             - {name: VIBESHORTS_PUBLIC_URL, value: 'https://YOUR_API_ORIGIN'}

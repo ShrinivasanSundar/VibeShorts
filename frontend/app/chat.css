@@ -435,6 +435,12 @@
 .chat-review .chat-card-actions {
   padding: 14px 0 0;
 }
+.chat-review-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  padding: 12px 0 0;
+}
 .chat-production-status {
   display: flex;
   align-items: center;

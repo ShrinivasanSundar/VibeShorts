@@ -53,6 +53,8 @@ export type Approval = {
   id: string;
   kind: string;
   target_artifact_id: string;
+  /** Images to review for asset and keyframe approvals. */
+  artifact_ids?: string[];
   decision: string;
   run_id: string | null;
   conversation_id?: string;

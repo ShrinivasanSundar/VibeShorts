@@ -37,7 +37,15 @@ def test_vertex_client_snapshots_route_disables_transport_retries_and_extracts_b
             return types.GenerateContentResponse(
                 candidates=[
                     types.Candidate(
-                        content=types.Content(parts=[types.Part.from_bytes(data=png, mime_type="image/png")])
+                        content=types.Content(
+                            parts=[
+                                # Interim thinking images must not count as the result.
+                                types.Part(
+                                    inline_data=types.Blob(data=b"draft", mime_type="image/png"), thought=True
+                                ),
+                                types.Part.from_bytes(data=png, mime_type="image/png"),
+                            ]
+                        )
                     )
                 ],
                 usage_metadata=types.GenerateContentResponseUsageMetadata(
@@ -64,7 +72,7 @@ def test_vertex_client_snapshots_route_disables_transport_retries_and_extracts_b
     assert seen["config"].image_config.aspect_ratio == "9:16"
     assert seen["closed"]
     assert provider.cost(output.usage, snapshot) == (38703, "usage_estimate")
-    assert snapshot["deprecated"]
+    assert not snapshot["deprecated"] and snapshot["launch_stage"] == "preview"
 
 
 @pytest.mark.parametrize(

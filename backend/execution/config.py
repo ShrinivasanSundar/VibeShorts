@@ -21,10 +21,10 @@ class Settings(BaseSettings):
     public_url: str = "http://127.0.0.1:8000"
     web_url: str = "http://127.0.0.1:3000"
     provider: Literal["fixture", "vertex", "developer"] = "fixture"
-    image_model: str = "gemini-2.5-flash-image"
+    image_model: str = "gemini-3-pro-image-preview"
     google_location: str = "global"
     video_model: str = "veo-3.1-generate-001"
-    video_generate_audio: bool = True
+    video_generate_audio: bool = False
     developer_video_model: str = "veo-3.1-generate-preview"
     developer_music_model: str = "lyria-3-clip-preview"
     video_location: str = "us-central1"

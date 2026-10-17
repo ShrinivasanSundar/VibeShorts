@@ -54,8 +54,13 @@ def ground_references(plan, attachments):
     Scenes without continuity get them first, within the three-reference limit; continuity
     scenes start from the previous scene's frame, which already carries the subject.
     """
-    used = {aid for scene in plan.scenes for aid in scene.reference_artifact_ids}
+    used = {aid for item in [*plan.scenes, *plan.assets] for aid in item.reference_artifact_ids}
     if not attachments or used & set(attachments):
+        return plan
+    if plan.assets:
+        # Assets are generated first and feed every scene, so attachments belong on the main one.
+        merged = dict.fromkeys([*attachments, *plan.assets[0].reference_artifact_ids])
+        plan.assets[0].reference_artifact_ids = list(merged)[:3]
         return plan
     for scene in plan.scenes:
         if not scene.continuity_from_scene_id:
@@ -979,7 +984,11 @@ class ConversationScheduler:
                 if active.get("pending_approval_id")
                 else None
             )
-            if approval and approval["decision"] == "pending" and approval["kind"] in {"storyboard", "scene"}:
+            if (
+                approval
+                and approval["decision"] == "pending"
+                and approval["kind"] in {"storyboard", "assets", "keyframes", "scene"}
+            ):
                 return [{"kind": "review", **approval}]
             prepared_id = active.get("workflow", {}).get("children", {}).get(turn.scene_id + ":prepared")
             prepared = c.repo.get(project_path(project, "jobs", prepared_id)) if prepared_id else None
@@ -1015,14 +1024,19 @@ class ConversationScheduler:
             previous = {s["id"]: s for s in old["scenes"]}
             affected = set(force_scene_ids or ())
             visual_fields = ("visual_prompt", "reference_artifact_ids", "continuity_from_scene_id")
+            restyled = old["aspect_ratio"] != plan.aspect_ratio or old.get("creative_preferences") != (
+                plan.creative_preferences.model_dump() if plan.creative_preferences else None
+            )
+            old_assets = {a["id"]: a for a in old.get("assets", [])}
+            changed_assets = {a.id for a in plan.assets if restyled or old_assets.get(a.id) != a.model_dump()}
             for scene in plan.scenes:
                 before = previous.get(scene.id)
                 if (
                     not before
-                    or old["aspect_ratio"] != plan.aspect_ratio
-                    or old.get("creative_preferences")
-                    != (plan.creative_preferences.model_dump() if plan.creative_preferences else None)
+                    or restyled
                     or any(before[k] != getattr(scene, k) for k in visual_fields)
+                    or before.get("asset_ids", []) != scene.asset_ids
+                    or changed_assets & set(scene.asset_ids)
                 ):
                     affected.add(scene.id)
             changed = True
@@ -1032,6 +1046,10 @@ class ConversationScheduler:
                 affected |= more
             for key, jid in active["workflow"]["children"].items():
                 if key in {"composition", "draft", "export"} or key.split(":")[0] in affected:
+                    continue
+                if key.startswith("assets:") and (
+                    key[7:] in changed_assets or key[7:] not in {a.id for a in plan.assets}
+                ):
                     continue
                 job = c.repo.get(project_path(project, "jobs", jid))
                 if not job or job["status"] != "succeeded":

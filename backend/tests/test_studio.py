@@ -17,7 +17,11 @@ from tools.contracts.studio import (
     BriefInput,
     Clip,
     Composition,
+    MusicInput,
     RenderInput,
+    Scene,
+    StoryAsset,
+    Storyboard,
     StudioCommand,
     VideoInput,
 )
@@ -215,13 +219,27 @@ def test_fixture_workflow_survives_restart_and_two_gates(runtime, alice, project
             approved=True,
         ),
     )
-    for _ in range(14):
+    for _ in range(16):
         restarted = Runtime(runtime.commands)
         WorkflowScheduler(restarted.commands).sweep()
         for job in restarted.commands.repo.list(project_path(project, "jobs")):
             if job["status"] == "queued":
                 restarted.worker.execute(project, job["job_id"])
         run = restarted.commands.get_run(alice, project, handle.run_id)
+        if run.pending_approval_id and run.approval["kind"] == "keyframes":
+            assert not any(
+                j["kind"] == "video" for j in runtime.commands.repo.list(project_path(project, "jobs"))
+            )
+            restarted.commands.decide_approval(
+                alice,
+                project,
+                run.approval["id"],
+                ApprovalDecision(
+                    idempotency_key="approve-keyframes",
+                    target_artifact_id=run.approval["target_artifact_id"],
+                    approved=True,
+                ),
+            )
         if run.pending_approval_id and run.approval["kind"] == "preview":
             break
     assert run.status == "needs_approval", run
@@ -395,3 +413,103 @@ def test_cancelled_workflow_cannot_be_revived_by_scheduler(runtime, alice, proje
     artifact = runtime.commands.get_job(alice, project, handle.job_id).artifact_ids[0]
     assert not scheduler.approval(project, handle.run_id, "storyboard", artifact)
     assert runtime.commands.get_run(alice, project, handle.run_id).status == "cancelled"
+
+
+def test_assets_are_created_and_approved_before_keyframes_and_videos(runtime, alice, project, monkeypatch):
+    original = StudioProvider.generate
+
+    def planned(self, request, references, snapshot, job):
+        if self.kind == "storyboard":
+            story = Storyboard(
+                project_id=job["project_id"],
+                brand_version=job["brand_version"],
+                duration_seconds=6,
+                assets=[
+                    StoryAsset(id="robot", kind="character", description="A small red robot with round eyes"),
+                    StoryAsset(id="garden", kind="location", description="A sunny walled garden"),
+                ],
+                scenes=[
+                    Scene(
+                        id="scene-1",
+                        objective="Meet",
+                        editorial_duration_seconds=2,
+                        visual_prompt="The robot waves",
+                        asset_ids=["robot", "garden"],
+                    ),
+                    Scene(
+                        id="scene-2",
+                        objective="Walk",
+                        editorial_duration_seconds=2,
+                        visual_prompt="The robot walks",
+                        asset_ids=["robot"],
+                    ),
+                    Scene(id="scene-3", objective="End", editorial_duration_seconds=2, visual_prompt="Logo"),
+                ],
+                music=MusicInput(prompt="Calm"),
+            )
+            return ImageOutput(story.model_dump_json().encode(), "application/json")
+        return original(self, request, references, snapshot, job)
+
+    monkeypatch.setattr(StudioProvider, "generate", planned)
+    handle = runtime.commands.create_video(
+        alice,
+        StudioCommand(
+            project_id=project,
+            idempotency_key="assets",
+            input=BriefInput(brief="A robot", duration_seconds=6),
+        ),
+    )
+    runtime.worker.execute(project, handle.job_id)
+
+    def advance(times=4):
+        for _ in range(times):
+            WorkflowScheduler(runtime.commands).sweep()
+            for job in runtime.commands.repo.list(project_path(project, "jobs")):
+                if job["status"] == "queued":
+                    runtime.worker.execute(project, job["job_id"])
+        return runtime.commands.get_run(alice, project, handle.run_id)
+
+    def approve(run, key):
+        runtime.commands.decide_approval(
+            alice,
+            project,
+            run.approval["id"],
+            ApprovalDecision(
+                idempotency_key=key, target_artifact_id=run.approval["target_artifact_id"], approved=True
+            ),
+        )
+
+    def jobs(kind):
+        return [j for j in runtime.commands.repo.list(project_path(project, "jobs")) if j["kind"] == kind]
+
+    approve(advance(1), "story")
+    run = advance()
+    assert run.approval["kind"] == "assets"
+    assert len(run.approval["artifact_ids"]) == 2
+    assert len(jobs("image")) == 2, "No keyframe may start before the assets are approved"
+    assets = {
+        key.split(":")[1]: runtime.commands.repo.get(project_path(project, "jobs", jid))["artifact_ids"][0]
+        for key, jid in run.workflow["children"].items()
+        if key.startswith("assets:")
+    }
+
+    approve(run, "assets")
+    run = advance()
+    assert run.approval["kind"] == "keyframes"
+    assert len(run.approval["artifact_ids"]) == 3
+    assert not jobs("video"), "No video may start before the keyframes are approved"
+    keyframe = runtime.commands.repo.get(
+        project_path(project, "jobs", run.workflow["children"]["scene-1:keyframe"])
+    )
+    assert keyframe["input"]["reference_artifact_ids"] == [assets["robot"], assets["garden"]]
+    assert "A small red robot with round eyes" in keyframe["input"]["prompt"]
+    plain = runtime.commands.repo.get(
+        project_path(project, "jobs", run.workflow["children"]["scene-3:keyframe"])
+    )
+    assert plain["input"]["reference_artifact_ids"] == []
+
+    approve(run, "keyframes")
+    advance(2)
+    videos = jobs("video")
+    assert len(videos) == 3
+    assert any("A small red robot with round eyes" in j["input"]["prompt"] for j in videos)

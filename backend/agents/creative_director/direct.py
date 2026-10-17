@@ -68,9 +68,9 @@ async def main():
         parts.append(types.Part.from_bytes(data=base64.b64decode(image["data"]), mime_type="image/jpeg"))
     grounding = (
         " The user's reference images follow the request, each labelled with its artifact id. "
-        "Look at them: they show the exact subject, product, character or style to use. In every "
-        "scene that shows that subject, describe its real appearance (shape, colours, materials, "
-        "distinguishing details) in visual_prompt and list its artifact id in reference_artifact_ids. "
+        "Look at them: they show the exact subject, product, character or style to use. Describe its "
+        "real appearance (shape, colours, materials, distinguishing details) in the matching asset's "
+        "description and list its artifact id in that asset's reference_artifact_ids. "
         "Keep the story about what the images show."
         if images
         else ""
@@ -91,6 +91,11 @@ async def main():
             "human approval is required. "
             "Preserve unchanged scene ids, prompts and references. For copy-only edits "
             "preserve visual prompts exactly. "
+            "Every storyboard defines 1 to 3 reusable assets (main subject or character, optionally "
+            "location and style frame), each fully describing its appearance once; scenes list the "
+            "asset_ids they show and their visual_prompt covers only action, framing and camera. "
+            "Preserve unchanged asset ids and descriptions; change an asset only when its look "
+            "should change. "
             "Use 3 to 5 scenes totalling 6 to 30 seconds, each at most 8 seconds, 24 fps, "
             "instrumental music, and supported aspect ratios. "
             "Use the supplied project_id and brand_version. Default to settings. For "

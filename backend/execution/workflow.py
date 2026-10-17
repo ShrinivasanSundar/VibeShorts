@@ -89,7 +89,18 @@ class WorkflowScheduler:
 
         self.commands.repo.atomic(apply)
 
-    def approval(self, project, run_id, kind, target, *, owner=None, storyboard_id=None, scene_id=None):
+    def approval(
+        self,
+        project,
+        run_id,
+        kind,
+        target,
+        *,
+        owner=None,
+        storyboard_id=None,
+        scene_id=None,
+        artifact_ids=None,
+    ):
         def apply(tx):
             path = project_path(project, "runs", run_id)
             run = tx.get(path)
@@ -117,6 +128,7 @@ class WorkflowScheduler:
                     "scene_id": scene_id,
                     "run_id": run_id,
                     "target_artifact_id": target,
+                    "artifact_ids": artifact_ids or [],
                     "decision": "pending",
                     "created_at": self.commands.clock(),
                     "review_url": f"{self.commands.settings.web_url}/projects/{project}",
@@ -283,6 +295,91 @@ class WorkflowScheduler:
         from tools.contracts.studio import MusicInput
 
         submit("music", "music", MusicInput(**plan["music"]))
+
+        def wait():
+            latest = c.repo.get(project_path(project, "runs", run_id))
+            change(
+                project,
+                run_id,
+                workflow=flow,
+                status=latest["status"]
+                if latest["status"] in {"needs_approval", "needs_reconciliation"}
+                else "waiting_for_jobs",
+            )
+
+        preferences = plan.get("creative_preferences") or {}
+        style = ". Visual style: " + preferences["vibe"] + "." if preferences.get("vibe") else ""
+        # Assets first: every scene keyframe is drawn from the same approved reference images.
+        assets = {}
+        for asset in plan.get("assets", []):
+            submit(
+                "assets:" + asset["id"],
+                "image",
+                ImageInput(
+                    prompt=(
+                        "Use the attached reference image(s) as the exact subject: keep its shape, "
+                        "colours, materials, markings and identifying details unchanged. "
+                        if asset["reference_artifact_ids"]
+                        else ""
+                    )
+                    + f"Reference image of the {asset['kind']}: {asset['description']}{style} "
+                    "One clear, evenly lit image. No text, no logos.",
+                    aspect_ratio=plan["aspect_ratio"],
+                    reference_artifact_ids=asset["reference_artifact_ids"],
+                ),
+            )
+            assets[asset["id"]] = result("assets:" + asset["id"])
+        if not all(assets.values()):
+            wait()
+            return
+        owner = run["scheduler_owner"]
+        if assets and not self.approval(
+            project, run_id, "assets", story_id, owner=owner, artifact_ids=list(assets.values())
+        ):
+            change(project, run_id, workflow=flow)
+            return
+        descriptions = {
+            a["id"]: f"{a['kind'].capitalize()}: {a['description']}" for a in plan.get("assets", [])
+        }
+        keyframes = {}
+        for scene in plan["scenes"]:
+            if scene.get("continuity_from_scene_id"):
+                # Continuity scenes start from the previous scene's last frame once its video exists.
+                continue
+            used = scene.get("asset_ids", [])
+            references = list(dict.fromkeys([*(assets[a] for a in used), *scene["reference_artifact_ids"]]))
+            submit(
+                scene["id"] + ":keyframe",
+                "image",
+                ImageInput(
+                    # Without this, image models treat references as loose inspiration.
+                    prompt=(
+                        "The attached reference images are this video's approved assets: keep the subject's "
+                        "shape, colours, materials, markings and identifying details, the location and the "
+                        "visual style exactly as shown. "
+                        + " ".join(descriptions[a] for a in used)
+                        + " Scene: "
+                        if used
+                        else "Use the attached reference image(s) as the exact subject: keep its shape, "
+                        "colours, materials, markings and identifying details unchanged. "
+                        if references
+                        else ""
+                    )
+                    + scene["visual_prompt"]
+                    + style,
+                    aspect_ratio=plan["aspect_ratio"],
+                    reference_artifact_ids=references[:3],
+                ),
+            )
+            keyframes[scene["id"]] = result(scene["id"] + ":keyframe")
+        if not all(keyframes.values()):
+            wait()
+            return
+        if not self.approval(
+            project, run_id, "keyframes", story_id, owner=owner, artifact_ids=list(keyframes.values())
+        ):
+            change(project, run_id, workflow=flow)
+            return
         guided = flow.get("mode") == "guided"
         for scene in plan["scenes"]:
             if guided:
@@ -310,11 +407,13 @@ class WorkflowScheduler:
                     return
                 flow["current_scene_id"] = sid
             duration = scene["editorial_duration_seconds"]
-            preferences = plan.get("creative_preferences") or {}
-            visual_prompt = scene["visual_prompt"]
-            if preferences.get("vibe"):
-                visual_prompt += ". Visual style: " + preferences["vibe"] + "."
-            motion_prompt = visual_prompt
+            # Restating the assets keeps the subject stable while the video model animates it.
+            motion_prompt = (
+                " ".join(descriptions[a] for a in scene.get("asset_ids", []))
+                + (" Scene: " if scene.get("asset_ids") else "")
+                + scene["visual_prompt"]
+                + style
+            )
             if preferences.get("motion") == "slow_motion":
                 motion_prompt += " Slow motion action and gentle, deliberate camera movement."
 
@@ -345,28 +444,7 @@ class WorkflowScheduler:
                         return
                     continue
             else:
-                submit(
-                    sid + ":keyframe",
-                    "image",
-                    ImageInput(
-                        # Without this, image models treat references as loose inspiration.
-                        prompt=(
-                            "Use the attached reference image(s) as the exact subject: keep its shape, "
-                            "colours, materials, markings and identifying details unchanged. "
-                            if scene["reference_artifact_ids"]
-                            else ""
-                        )
-                        + visual_prompt,
-                        aspect_ratio=plan["aspect_ratio"],
-                        reference_artifact_ids=scene["reference_artifact_ids"],
-                    ),
-                )
-                anchor = result(sid + ":keyframe")
-                if not anchor:
-                    if guided:
-                        change(project, run_id, workflow=flow, status="waiting_for_jobs")
-                        return
-                    continue
+                anchor = keyframes[sid]
             source = next(d for d in (4, 6, 8) if d >= duration)
             submit(
                 sid + ":plate",

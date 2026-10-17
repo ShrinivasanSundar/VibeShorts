@@ -51,6 +51,15 @@ class FrameInput(Contract):
     spend_cap_micros: int | None = Field(default=None, ge=0)
 
 
+class StoryAsset(Contract):
+    """A reusable reference image generated once before any scene, so every scene shares it."""
+
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,60}$")
+    kind: Literal["subject", "character", "location", "style"]
+    description: str = Field(min_length=1, max_length=2000)
+    reference_artifact_ids: list[str] = Field(default_factory=list, max_length=3)
+
+
 class Scene(Contract):
     id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,60}$")
     objective: str = Field(min_length=1, max_length=500)
@@ -58,6 +67,7 @@ class Scene(Contract):
     editorial_duration_seconds: float = Field(gt=0, le=8)
     visual_prompt: str = Field(min_length=1, max_length=4000)
     reference_artifact_ids: list[str] = Field(default_factory=list, max_length=3)
+    asset_ids: list[str] = Field(default_factory=list, max_length=3)
     continuity_from_scene_id: str | None = None
 
 
@@ -75,6 +85,7 @@ class Storyboard(Contract):
     duration_seconds: float = Field(default=15, ge=6, le=30)
     aspect_ratio: Literal["9:16", "16:9"] = "9:16"
     fps: Literal[24] = 24
+    assets: list[StoryAsset] = Field(default_factory=list, max_length=3)
     scenes: list[Scene] = Field(min_length=3, max_length=5)
     music: MusicInput
 
@@ -83,6 +94,11 @@ class Storyboard(Contract):
         ids = [s.id for s in self.scenes]
         if len(ids) != len(set(ids)):
             raise ValueError("Scene ids must be unique")
+        asset_ids = [a.id for a in self.assets]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("Asset ids must be unique")
+        if any(not set(s.asset_ids) <= set(asset_ids) for s in self.scenes):
+            raise ValueError("Scenes may only use assets defined in the storyboard")
         seen = set()
         for scene in self.scenes:
             if scene.continuity_from_scene_id and scene.continuity_from_scene_id not in seen:

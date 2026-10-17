@@ -74,6 +74,13 @@ def approve(runtime, alice, project, approval):
     )
 
 
+def approve_keyframes(runtime, alice, project, chat):
+    tick(runtime, project, 4)
+    approval = state(runtime, alice, project, chat)["run"]["approval"]
+    assert approval["kind"] == "keyframes", approval
+    approve(runtime, alice, project, approval)
+
+
 def start(runtime, alice, project, chat, text="A 6 second story about a little robot"):
     runtime.commands.send_message(
         alice, project, chat, ConversationMessage(idempotency_key="idea", text=text, duration_seconds=6)
@@ -103,11 +110,20 @@ def test_guided_scene_gates_restart_and_export(runtime, alice, project, chat):
     assert first["run"]["approval"]["kind"] == "storyboard"
     assert not any(j["kind"] == "image" for j in runtime.commands.repo.list(project_path(project, "jobs")))
     approve(runtime, alice, project, first["run"]["approval"])
+    tick(runtime, project, 4)
+    frames = state(runtime, alice, project, chat)["run"]["approval"]
+    assert frames["kind"] == "keyframes"
+    assert len(frames["artifact_ids"]) == 3
+    assert not any(j["kind"] == "video" for j in runtime.commands.repo.list(project_path(project, "jobs")))
+    approve(runtime, alice, project, frames)
     tick(runtime, project, 8)
     current = state(runtime, alice, project, chat)
     assert current["run"]["approval"]["kind"] == "scene", current
     assert current["run"]["approval"]["scene_id"] == "scene-1"
-    assert not any(k.startswith("scene-2:") for k in current["run"]["workflow"]["children"])
+    assert not any(
+        k.startswith("scene-2:") and not k.endswith(":keyframe")
+        for k in current["run"]["workflow"]["children"]
+    )
     assert any(b["kind"] == "scene" for m in current["messages"] for b in m["blocks"])
     completed = finish(runtime, alice, project, chat)
     assert completed["conversation"]["composition_head"]
@@ -140,6 +156,7 @@ def test_storyboard_only_revise_before_production_and_stale_approval(runtime, al
 def test_copy_revision_reuses_generated_scene(runtime, alice, project, chat):
     current = start(runtime, alice, project, chat)
     approve(runtime, alice, project, current["run"]["approval"])
+    approve_keyframes(runtime, alice, project, chat)
     tick(runtime, project, 8)
     before = state(runtime, alice, project, chat)
     prepared = before["run"]["workflow"]["children"]["scene-1:prepared"]
@@ -249,7 +266,8 @@ def test_rest_conversation_routes(runtime, alice, project, chat):
 def test_revision_waits_for_current_scene_to_finish(runtime, alice, project, chat):
     current = start(runtime, alice, project, chat)
     approve(runtime, alice, project, current["run"]["approval"])
-    tick(runtime, project)  # The first keyframe is ready; the video is not created yet.
+    approve_keyframes(runtime, alice, project, chat)
+    tick(runtime, project)  # The first video is submitted; it is not prepared yet.
     old_run_id = current["run"]["run_id"]
     runtime.commands.send_message(
         alice,
@@ -262,7 +280,7 @@ def test_revision_waits_for_current_scene_to_finish(runtime, alice, project, cha
     assert old.status == "cancelled"
     prepared = old.workflow["children"]["scene-1:prepared"]
     assert runtime.commands.get_job(alice, project, prepared).status == "succeeded"
-    assert "scene-2:keyframe" not in old.workflow["children"]
+    assert "scene-2:plate" not in old.workflow["children"]
     revised = state(runtime, alice, project, chat)
     assert revised["run"]["approval"]["kind"] == "storyboard"
     assert "scene-1:prepared" not in revised["run"]["workflow"]["children"]
@@ -288,6 +306,7 @@ def test_failed_scene_retry_retains_new_job_and_is_idempotent(runtime, alice, pr
     run_doc = runtime.commands.repo.get(project_path(project, "runs", failed["run"]["run_id"]))
     new_id = run_doc["workflow"]["children"]["scene-1:keyframe"]
     assert new_id != old_id and new_id in run_doc["job_ids"]
+    approve_keyframes(runtime, alice, project, chat)
     tick(runtime, project, 8)
     assert state(runtime, alice, project, chat)["run"]["approval"]["kind"] == "scene"
 
@@ -594,6 +613,8 @@ def test_unified_bulk_preferences_review_and_complete_projection(runtime, alice,
         current = state(runtime, alice, project, cid)
         approval = current["run"]["approval"]
         assert not approval or approval["kind"] != "scene"
+        if approval and approval["kind"] == "keyframes" and approval["decision"] == "pending":
+            approve(runtime, alice, project, approval)
         if approval and approval["kind"] == "preview":
             break
     assert current["run"]["approval"]["kind"] == "preview"
@@ -826,3 +847,43 @@ def test_busy_advance_is_redelivered_and_still_flushes(runtime, alice, project, 
     assert {"project_id": project, "kind": "advance", "target": "conversation", "target_id": chat} in (
         queue.messages
     )
+
+
+def test_asset_revision_regenerates_only_that_asset_and_its_scenes(
+    runtime, alice, project, chat, monkeypatch
+):
+    import tools.conversation_fixture as fixture
+    from tools.contracts.studio import DirectorTurn, StoryAsset, Storyboard
+
+    original = fixture.fixture_turn
+
+    def with_assets(request, project_id, brand_version):
+        story = request.context.get("storyboard")
+        if story and "blue" in request.instruction:
+            plan = Storyboard.model_validate(story)
+            plan.assets[0].description = "A small blue robot"
+            return DirectorTurn(action="storyboard", storyboard=plan, text="I’ve updated the robot.")
+        turn = original(request, project_id, brand_version)
+        if turn.storyboard and not turn.storyboard.assets:
+            turn.storyboard.assets = [
+                StoryAsset(id="robot", kind="character", description="A small red robot"),
+                StoryAsset(id="garden", kind="location", description="A sunny garden"),
+            ]
+            turn.storyboard.scenes[0].asset_ids = ["robot", "garden"]
+            turn.storyboard.scenes[1].asset_ids = ["garden"]
+        return turn
+
+    monkeypatch.setattr(fixture, "fixture_turn", with_assets)
+    start(runtime, alice, project, chat)
+    children = finish(runtime, alice, project, chat)["run"]["workflow"]["children"]
+    assert {"assets:robot", "assets:garden"} <= set(children)
+    runtime.commands.send_message(
+        alice, project, chat, ConversationMessage(idempotency_key="blue", text="Make the robot blue")
+    )
+    tick(runtime, project, 5)
+    revised = state(runtime, alice, project, chat)["run"]["workflow"]["children"]
+    assert "assets:robot" not in revised
+    assert "scene-1:keyframe" not in revised
+    assert revised["assets:garden"] == children["assets:garden"]
+    assert revised["scene-2:keyframe"] == children["scene-2:keyframe"]
+    assert revised["scene-3:prepared"] == children["scene-3:prepared"]
