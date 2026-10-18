@@ -1,0 +1,39 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: vibeshorts-api
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '4'
+    spec:
+      serviceAccountName: vibeshorts-runtime@YOUR_PROJECT.iam.gserviceaccount.com
+      containerConcurrency: 8
+      timeoutSeconds: 600
+      containers:
+        - image: YOUR_REGION-docker.pkg.dev/YOUR_PROJECT/vibeshorts/api:YOUR_TAG
+          ports: [{containerPort: 8080}]
+          resources:
+            limits: {cpu: '2', memory: 2Gi}
+          env:
+            - {name: VIBESHORTS_MODE, value: production}
+            - {name: GOOGLE_CLOUD_PROJECT, value: YOUR_PROJECT}
+            - {name: VIBESHORTS_BUCKET, value: YOUR_PRIVATE_BUCKET}
+            - {name: VIBESHORTS_PROVIDER, value: vertex}
+            - {name: VIBESHORTS_GOOGLE_LOCATION, value: global}
+            - {name: VIBESHORTS_IMAGE_MODEL, value: gemini-3-pro-image-preview}
+            - {name: VIBESHORTS_RENDER_RUNNER, value: cloud_run}
+            - {name: VIBESHORTS_RENDER_CLOUD_JOB, value: projects/YOUR_PROJECT/locations/YOUR_REGION/jobs/vibeshorts-render}
+            - {name: VIBESHORTS_PUBLIC_URL, value: 'https://YOUR_API_ORIGIN'}
+            - {name: VIBESHORTS_WEB_URL, value: 'https://YOUR_WEB_ORIGIN'}
+            - {name: VIBESHORTS_INTERNAL_AUDIENCE, value: 'https://YOUR_API_ORIGIN'}
+            - {name: VIBESHORTS_INTERNAL_SERVICE_EMAILS, value: 'vibeshorts-dispatch@YOUR_PROJECT.iam.gserviceaccount.com,vibeshorts-scheduler@YOUR_PROJECT.iam.gserviceaccount.com'}
+            - {name: VIBESHORTS_PROJECT_CAP_MICROS, value: '1000000'}
+            - {name: VIBESHORTS_PAID_ALLOWANCE_MICROS, value: '0'}
+            - name: VIBESHORTS_RATE_JSON
+              valueFrom:
+                secretKeyRef: {name: vibeshorts-reviewed-rates, key: latest}
+            - name: VIBESHORTS_OAUTH_CLIENTS_JSON
+              valueFrom:
+                secretKeyRef: {name: vibeshorts-oauth-clients, key: latest}

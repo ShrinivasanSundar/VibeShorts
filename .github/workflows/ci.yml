@@ -1,0 +1,30 @@
+name: VibeShorts acceptance
+on: [push, pull_request]
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22.23.3', cache: npm}
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: '21'}
+      - uses: astral-sh/setup-uv@v6
+        with: {version: '0.10.0', enable-cache: true}
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: uv sync --project backend --frozen
+      - run: uv sync --project backend/agents/creative_director --frozen
+      - run: backend/agents/creative_director/.venv/bin/python backend/scripts/test-adk-sessions.py
+      - run: npm ci
+      - run: npm run check:integrations -- --backend-env backend/.env.example --frontend-env frontend/.env.example
+      - run: npx playwright install-deps chromium
+      - run: node_modules/.bin/hyperframes browser ensure
+      - run: uv run --directory backend ruff check api tools execution providers worker mcp tests agents sessions scripts
+      - run: uv run --directory backend ruff format --check api tools execution providers worker mcp tests agents sessions scripts
+      - run: uv run --directory backend pytest -q -m 'not emulator and not paid'
+      - run: npm run check:web && npm run build:web
+      - run: npm run test:emulators

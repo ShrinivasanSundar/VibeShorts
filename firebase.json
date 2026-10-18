@@ -1,0 +1,11 @@
+{
+  "firestore": {"rules": "infrastructure/firestore.rules", "indexes": "infrastructure/firestore.indexes.json"},
+  "storage": {"rules": "infrastructure/storage.rules"},
+  "emulators": {
+    "auth": {"host": "127.0.0.1", "port": 9099},
+    "firestore": {"host": "127.0.0.1", "port": 18080, "websocketPort": 19150},
+    "storage": {"host": "127.0.0.1", "port": 9199},
+    "pubsub": {"host": "127.0.0.1", "port": 18085},
+    "ui": {"enabled": false}, "singleProjectMode": true
+  }
+}

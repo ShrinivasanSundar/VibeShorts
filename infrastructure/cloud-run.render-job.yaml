@@ -1,0 +1,18 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: vibeshorts-render
+spec:
+  template:
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          serviceAccountName: vibeshorts-render@YOUR_PROJECT.iam.gserviceaccount.com
+          timeoutSeconds: 900
+          maxRetries: 0
+          containers:
+            - image: YOUR_REGION-docker.pkg.dev/YOUR_PROJECT/vibeshorts/render:YOUR_TAG
+              command: ["python", "-m", "worker.render_job"]
+              resources:
+                limits: {cpu: '4', memory: 4Gi}

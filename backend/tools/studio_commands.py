@@ -1,0 +1,442 @@
+from collections import OrderedDict
+from copy import deepcopy
+from threading import Lock
+
+from execution.read_context import read_command
+from tools.composition.package import unpack
+from tools.contracts.errors import AppError
+from tools.contracts.models import GENERATE, DataResult, JobResult
+from tools.conversations import head_path
+
+# Parsed storyboards and composition manifests, keyed by verified content hash.
+# Artifacts are immutable, so entries never go stale; authorization is still checked per call.
+_DECODED: OrderedDict = OrderedDict()
+_DECODED_LOCK = Lock()
+
+
+def decoded(kind, digest, load):
+    key = (kind, digest)
+    with _DECODED_LOCK:
+        if key in _DECODED:
+            _DECODED.move_to_end(key)
+            return deepcopy(_DECODED[key])
+    value = load()
+    with _DECODED_LOCK:
+        _DECODED[key] = value
+        while len(_DECODED) > 512:
+            _DECODED.popitem(last=False)
+    return deepcopy(value)
+
+
+def input_ids(kind, value):
+    ids = list(value.reference_artifact_ids)
+    for key in ("first_frame_artifact_id", "artifact_id", "composition_artifact_id"):
+        if getattr(value, key, None):
+            ids.append(getattr(value, key))
+    if kind == "edit":
+        ids.append(value.expected_head)
+    if kind == "composition":
+        ids.extend(c.artifact_id for c in value.clips if c.artifact_id)
+        ids.extend(value.fonts.values())
+    return list(dict.fromkeys(ids))
+
+
+def validate_submission(commands, caller, project_id, kind, value, tx=None, conversation_id=None):
+    from tools.commands import project_path
+
+    tx = tx or commands.repo
+    commands.authorize(caller, project_id, GENERATE, tx)
+    if conversation_id:
+        commands.conversation(caller, project_id, conversation_id, tx, GENERATE)
+    for artifact_id in input_ids(kind, value):
+        artifact = commands._artifact(project_id, artifact_id, tx)
+        if kind in {"image", "storyboard"} and artifact["type"] != "image":
+            raise AppError("INVALID_INPUT", "References must be image artifacts")
+        if kind == "video" and artifact["type"] != "image":
+            raise AppError("INVALID_INPUT", "Video first frame must be an image")
+        if kind in {"prepare", "frame"} and artifact["type"] not in {"video", "audio", "render"}:
+            raise AppError("INVALID_INPUT", "Preparation requires video or audio")
+        if kind == "composition":
+            if artifact_id in value.fonts.values() and artifact["type"] != "font":
+                raise AppError("INVALID_INPUT", "Font references require decoded font artifacts")
+            for clip in value.clips:
+                if clip.artifact_id != artifact_id:
+                    continue
+                actual = (
+                    "video"
+                    if artifact["type"] == "render"
+                    else "audio"
+                    if clip.kind == "audio"
+                    else clip.kind
+                )
+                if ("video" if artifact["type"] == "render" else artifact["type"]) != actual:
+                    raise AppError("INVALID_INPUT", "Clip type does not match artifact")
+                if clip.kind == "video" and clip.volume > 0 and not artifact["media"].get("has_audio"):
+                    raise AppError("INVALID_INPUT", "This video has no audio stream")
+                duration = artifact["media"].get("duration_seconds")
+                if duration and clip.source_in + clip.duration > duration + 0.05:
+                    raise AppError("INVALID_INPUT", "Clip exceeds the source duration")
+    if kind == "storyboard" and value.revision_of_run_id:
+        project = tx.get(head_path(project_id, conversation_id))
+        if project.get("composition_head") != value.expected_head:
+            raise AppError("REVISION_CONFLICT", "Composition head advanced", 409)
+    if kind in {"composition", "edit"}:
+        project = tx.get(head_path(project_id, conversation_id))
+        if project.get("composition_head") != value.expected_head:
+            raise AppError("REVISION_CONFLICT", "Composition head advanced", 409)
+    if kind == "render":
+        artifact = commands._artifact(project_id, value.composition_artifact_id, tx)
+        if artifact["type"] != "composition":
+            raise AppError("INVALID_INPUT", "Rendering requires a composition package")
+        if value.quality == "final":
+            project = tx.get(head_path(project_id, conversation_id))
+            approval = tx.get(
+                project_path(project_id, "approved_compositions", value.composition_artifact_id)
+            )
+            if (
+                project.get("composition_head") != value.composition_artifact_id
+                or not approval
+                or not approval["approved"]
+            ):
+                raise AppError(
+                    "APPROVAL_REQUIRED", "This exact current composition must be approved in the app", 409
+                )
+
+
+class StudioCommands:
+    def generate_video(self, caller, request):
+        return self.submit_job(caller, request, "video")
+
+    def generate_music(self, caller, request):
+        return self.submit_job(caller, request, "music")
+
+    def prepare_media(self, caller, request):
+        return self.submit_job(caller, request, "prepare")
+
+    def extract_frame(self, caller, request):
+        return self.submit_job(caller, request, "frame")
+
+    def create_video(self, caller, request):
+        return self.submit_job(caller, request, "storyboard")
+
+    def create_hyperframe(self, caller, request):
+        return self.submit_job(caller, request, "composition")
+
+    def update_hyperframe(self, caller, request):
+        return self.submit_job(caller, request, "composition")
+
+    def render_hyperframe(self, caller, request):
+        return self.submit_job(caller, request, "render")
+
+    def edit_hyperframe(self, caller, request):
+        return self.submit_job(caller, request, "edit")
+
+    def invalidated_assets(self, caller, project_id, artifact_id):
+        self.authorize(caller, project_id)
+        self._artifact(project_id, artifact_id)
+        from tools.composition.edits import invalidation
+
+        return DataResult(data={"artifact_ids": invalidation(self, project_id, [artifact_id])})
+
+    @read_command
+    def inspect_media(self, caller, project_id, artifact_id):
+        self.authorize(caller, project_id)
+        return DataResult(data=self._artifact(project_id, artifact_id)["media"])
+
+    @read_command
+    def get_hyperframe(self, caller, project_id, artifact_id=None, conversation_id=None):
+        project = (
+            self.conversation(caller, project_id, conversation_id)
+            if conversation_id
+            else self.authorize(caller, project_id)
+        )
+        artifact_id = artifact_id or project.get("composition_head")
+        if not artifact_id:
+            return DataResult(data={"artifact_id": None, "manifest": None})
+        artifact = self._artifact(project_id, artifact_id)
+        if artifact["type"] != "composition":
+            raise AppError("INVALID_INPUT", "Artifact is not a composition")
+        manifest = decoded(
+            "manifest",
+            artifact["content_sha256"],
+            lambda: unpack(self.asset_content(caller, project_id, artifact_id)[0])[0],
+        )
+        return DataResult(
+            data={
+                "artifact_id": artifact_id,
+                "manifest": manifest,
+                "current": project.get("composition_head") == artifact_id,
+            }
+        )
+
+    @read_command
+    def get_storyboard(self, caller, project_id, artifact_id):
+        self.authorize(caller, project_id)
+        return DataResult(data=self._storyboard(caller, project_id, artifact_id))
+
+    def _storyboard(self, caller, project_id, artifact_id):
+        """Storyboard for an already-authorized caller; parsed content is cached by hash."""
+        from tools.contracts.studio import Storyboard
+
+        artifact = self._artifact(project_id, artifact_id)
+        if artifact["type"] != "storyboard":
+            raise AppError("INVALID_INPUT", "Artifact is not a storyboard")
+        return decoded(
+            "storyboard",
+            artifact["content_sha256"],
+            lambda: Storyboard.model_validate_json(
+                self.asset_content(caller, project_id, artifact_id)[0]
+            ).model_dump(),
+        )
+
+    @read_command
+    def studio_state(
+        self, caller, project_id, conversation_id=None, include_history=True, include_assets=True
+    ):
+        from tools.commands import project_path
+
+        project = self.authorize(caller, project_id)
+        conversation = self.conversation(caller, project_id, conversation_id) if conversation_id else None
+        if conversation:
+            project = {**project, "composition_head": conversation.get("composition_head")}
+
+        def history(collection, limit):
+            if not include_history:
+                return []
+            filters = [("conversation_id", "==", conversation_id)] if conversation_id else []
+            return self.repo.query(
+                project_path(project_id, collection),
+                filters=filters,
+                order=[("created_at", True)],
+                limit=limit,
+            )
+
+        jobs, runs, approvals = history("jobs", 60), history("runs", 20), history("approvals", 20)
+        if include_history and conversation and conversation.get("active_run_id"):
+            if not any(r["run_id"] == conversation["active_run_id"] for r in runs):
+                active = self.repo.get(project_path(project_id, "runs", conversation["active_run_id"]))
+                if active:
+                    runs = [active, *runs[:19]]
+        approvals_by_id = {a["id"]: a for a in approvals}
+        return DataResult(
+            data={
+                "project": {
+                    k: project.get(k) for k in ("project_id", "name", "brand_version", "composition_head")
+                },
+                "budget": self.repo.get("budgets/" + project_id),
+                "provider_route": self.settings.provider,
+                "runs": [
+                    self._run_result(
+                        r,
+                        [j for j in jobs if j["run_id"] == r["run_id"]],
+                        approvals_by_id.get(r.get("pending_approval_id")),
+                    ).model_dump()
+                    for r in runs
+                ],
+                "jobs": [
+                    JobResult(**{k: j[k] for k in JobResult.model_fields if k in j}).model_dump()
+                    | {"kind": j.get("kind", "image")}
+                    for j in jobs
+                ],
+                "assets": self.list_assets(caller, project_id, 20).model_dump()
+                if include_assets
+                else {"assets": [], "next_cursor": None},
+                "approvals": approvals,
+                "brand": self.repo.get(
+                    project_path(project_id, "brands", f"brand_{project['brand_version']}")
+                ),
+                "events": self.repo.recent(project_path(project_id, "events"), 60) if include_history else [],
+            }
+        )
+
+    def decide_approval(self, caller, project_id, approval_id, request):
+        from tools.commands import project_path
+
+        if caller.projects is not None or caller.grant_id:
+            raise AppError("ACCESS_DENIED", "Approval requires human app authentication", 403)
+
+        def apply(tx):
+            self.authorize(caller, project_id, GENERATE, tx)
+
+            def build():
+                path = project_path(project_id, "approvals", approval_id)
+                approval = tx.get(path)
+                if not approval or approval["target_artifact_id"] != request.target_artifact_id:
+                    raise AppError("REVISION_CONFLICT", "Approval target mismatch", 409)
+                if approval["decision"] != "pending":
+                    raise AppError("REVISION_CONFLICT", "Approval already decided", 409)
+                run = (
+                    tx.get(project_path(project_id, "runs", approval["run_id"]))
+                    if approval.get("run_id")
+                    else None
+                )
+                if run and (
+                    run["status"] in {"cancelled", "failed"} or run.get("pending_approval_id") != approval_id
+                ):
+                    raise AppError("REVISION_CONFLICT", "Approval is no longer current", 409)
+                if run and approval.get("conversation_id"):
+                    conversation = tx.get(head_path(project_id, approval["conversation_id"]))
+                    if conversation.get("active_run_id") != run["run_id"]:
+                        raise AppError("REVISION_CONFLICT", "This video has a newer workflow", 409)
+                if request.approved and approval.get("conversation_id"):
+                    current = tx.get(head_path(project_id, approval["conversation_id"]))
+                    latest = current.get("latest_request_id")
+                    message = (
+                        tx.get(head_path(project_id, approval["conversation_id"]) + "/messages/" + latest)
+                        if latest
+                        else None
+                    )
+                    if message and message.get("status") in {"queued", "running", "needs_reconciliation"}:
+                        raise AppError(
+                            "REVISION_CONFLICT", "Wait for your requested changes before approving", 409
+                        )
+                if approval["kind"] == "preview":
+                    project = tx.get(head_path(project_id, approval.get("conversation_id")))
+                    if project.get("composition_head") != request.target_artifact_id:
+                        raise AppError("REVISION_CONFLICT", "Preview revision is stale", 409)
+                    tx.set(
+                        project_path(project_id, "approved_compositions", request.target_artifact_id),
+                        {
+                            "approved": request.approved,
+                            "reviewer_uid": caller.uid,
+                            "approval_id": approval_id,
+                        },
+                    )
+                approval.update(
+                    decision="approved" if request.approved else "rejected",
+                    reviewer_uid=caller.uid,
+                    decided_at=self.clock(),
+                )
+                tx.set(path, approval)
+                if run:
+                    run["pending_approval_id"] = None
+                    run["status"] = (
+                        "waiting_for_jobs"
+                        if request.approved
+                        else "needs_approval"
+                        if run.get("workflow", {}).get("mode") == "guided"
+                        else "failed"
+                    )
+                    run["version"] += 1
+                    tx.set(project_path(project_id, "runs", run["run_id"]), run)
+                    self.project_run(tx, run)
+                    if run.get("workflow"):
+                        self.enqueue_advance(tx, project_id, "run", run["run_id"])
+                if approval.get("conversation_id"):
+                    self.enqueue_advance(tx, project_id, "conversation", approval["conversation_id"])
+                return approval
+
+            return self._idempotent(
+                tx,
+                project_path(project_id),
+                "approval.decide",
+                request.idempotency_key,
+                request.model_dump() | {"approval_id": approval_id},
+                build,
+                caller.uid,
+            )
+
+        return DataResult(data=self.repo.atomic(apply))
+
+    def request_preview_approval(self, caller, project_id, artifact_id, key, conversation_id=None):
+        from tools.commands import project_path
+
+        def apply(tx):
+            self.authorize(caller, project_id, GENERATE, tx)
+
+            def build():
+                artifact = self._artifact(project_id, artifact_id, tx)
+                current = tx.get(head_path(project_id, conversation_id))
+                if not current or current.get("composition_head") != artifact_id:
+                    raise AppError("REVISION_CONFLICT", "Review the current composition", 409)
+                if artifact["type"] != "composition":
+                    raise AppError("INVALID_INPUT", "Composition required")
+                approval_id = "approval_" + artifact_id + "_preview"
+                existing = tx.get(project_path(project_id, "approvals", approval_id))
+                if existing:
+                    return existing
+                approval = {
+                    "id": approval_id,
+                    "kind": "preview",
+                    "conversation_id": conversation_id,
+                    "run_id": None,
+                    "target_artifact_id": artifact_id,
+                    "decision": "pending",
+                    "created_at": self.clock(),
+                    "review_url": f"{self.settings.web_url}/projects/{project_id}",
+                }
+                tx.set(project_path(project_id, "approvals", approval_id), approval)
+                return approval
+
+            return self._idempotent(
+                tx,
+                project_path(project_id),
+                "preview.request",
+                key,
+                {"artifact_id": artifact_id, "conversation_id": conversation_id},
+                build,
+                caller.uid,
+            )
+
+        return DataResult(data=self.repo.atomic(apply))
+
+    def update_member(self, caller, project_id, request):
+        from tools.commands import checked_id, project_path
+
+        def apply(tx):
+            project = self.authorize(caller, project_id, GENERATE, tx)
+            if project["owner_uid"] != caller.uid or caller.projects is not None:
+                raise AppError("ACCESS_DENIED", "Only the project owner may manage members", 403)
+
+            def build():
+                checked_id(request.uid)
+                user = tx.get("users/" + request.uid)
+                if not user or not user["access_enabled"]:
+                    raise AppError("INVALID_INPUT", "Member must first sign in to VibeShorts")
+                if request.uid == project["owner_uid"]:
+                    raise AppError("INVALID_INPUT", "Owner cannot be removed")
+                if request.role:
+                    project["members"][request.uid] = request.role
+                else:
+                    project["members"].pop(request.uid, None)
+                tx.set(project_path(project_id), project)
+                return {"uid": request.uid, "role": request.role}
+
+            return self._idempotent(
+                tx,
+                project_path(project_id),
+                "member.update",
+                request.idempotency_key,
+                request.model_dump(),
+                build,
+                caller.uid,
+            )
+
+        return DataResult(data=self.repo.atomic(apply))
+
+    @read_command
+    def brand_assessment(self, caller, project_id, artifact_id):
+        self.authorize(caller, project_id)
+        artifact = self._artifact(project_id, artifact_id)
+        project = self.authorize(caller, project_id)
+        from tools.commands import project_path
+
+        brand = self.repo.get(project_path(project_id, "brands", f"brand_{project['brand_version']}"))
+        result = {
+            "artifact_id": artifact_id,
+            "method": "deterministic required-asset and palette checks",
+            "checks": [],
+        }
+        if artifact["type"] == "composition":
+            manifest = self.get_hyperframe(caller, project_id, artifact_id).data["manifest"]
+            palette = {manifest["timeline"][k].lower() for k in ("background", "foreground", "accent")}
+            inputs = set(manifest["input_artifact_ids"])
+            if brand:
+                for color in brand.get("colors", {}).values():
+                    result["checks"].append({"label": color, "passed": color.lower() in palette})
+                if brand.get("logo"):
+                    result["checks"].append({"label": "Exact brand logo", "passed": brand["logo"] in inputs})
+                for role, font in brand.get("fonts", {}).items():
+                    result["checks"].append({"label": "Exact " + role + " font", "passed": font in inputs})
+        result["passed"] = bool(result["checks"]) and all(c["passed"] for c in result["checks"])
+        return DataResult(data=result)

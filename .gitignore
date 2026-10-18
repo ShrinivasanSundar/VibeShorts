@@ -1,0 +1,27 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+node_modules/
+.next/
+.next-fixture/
+.env
+.env.local
+.env.*.local
+.env.production
+!.env.example
+firebase-debug.log
+*-debug.log
+emulator-data/
+dist/
+build/
+*.egg-info/
+.coverage
+coverage/
+*.tsbuildinfo
+
+infrastructure/production.env
+# Service-account keys must never be committed.
+**/service-account*.json
